@@ -1,0 +1,24 @@
+{
+  "name": "voice-buddy-backend",
+  "version": "1.0.0",
+  "description": "Express backend for Heney Assistant (Gemini API)",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "keywords": [
+    "gemini",
+    "voice-assistant",
+    "express"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@google/genai": "^1.0.0",
+    "@supabase/supabase-js": "^2.108.2",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.2"
+  }
+}
