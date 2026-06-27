@@ -33,6 +33,8 @@ const ttsSupported =
   typeof window !== "undefined" && "speechSynthesis" in window;
 const showVoiceDebug = import.meta.env.VITE_SHOW_VOICE_DEBUG === "true";
 
+const TURN_END_GRACE_MS = 1000;
+const FALLBACK_SILENCE_DELAY_MS = 2200;
 const ASSISTANT_NAME = "Heney";
 const PREFERRED_VOICE_HINTS = [
   "natural",
@@ -106,6 +108,7 @@ function AssistantApp() {
   const [status, setStatus] = useState("Idle");
   const [error, setError] = useState("");
   const [micPermission, setMicPermission] = useState("unknown");
+  const [vadStatus, setVadStatus] = useState("not-loaded");
   const [voiceDebug, setVoiceDebug] = useState({
     listeningStarted: false,
     audioStarted: false,
@@ -118,8 +121,16 @@ function AssistantApp() {
   });
 
   const recognitionRef = useRef(null);
+  const vadRef = useRef(null);
   const scrollRef = useRef(null);
   const restartTimerRef = useRef(null);
+  const turnGraceTimerRef = useRef(null);
+  const fallbackTurnTimerRef = useRef(null);
+  const pendingTranscriptRef = useRef("");
+  const speechActiveRef = useRef(false);
+  const vadEnabledRef = useRef(false);
+  const vadLoadingRef = useRef(false);
+  const speakingResolveRef = useRef(null);
 
   const conversationRef = useRef(conversation);
   const messagesRef = useRef(messages);
@@ -271,13 +282,15 @@ function AssistantApp() {
     const recognition = new SpeechRecognition();
     recognition.lang = "en-US";
     recognition.interimResults = false;
-    recognition.continuous = false;
+    recognition.continuous = true;
 
     recognition.onstart = () => {
       console.log("[voice] recognition.onstart");
       listeningRef.current = true;
       setListening(true);
-      setStatus("Listening…");
+      if (!speechActiveRef.current && !loadingRef.current && !speakingRef.current) {
+        setStatus("Listening");
+      }
       setVoiceDebug((prev) => ({
         ...prev,
         listeningStarted: true,
@@ -296,6 +309,7 @@ function AssistantApp() {
 
     recognition.onspeechstart = () => {
       console.log("[voice] recognition.onspeechstart");
+      handleSpeechStart();
       setVoiceDebug((prev) => ({
         ...prev,
         speechDetected: true,
@@ -304,7 +318,13 @@ function AssistantApp() {
 
     recognition.onresult = (event) => {
       console.log("[voice] recognition.onresult", event);
-      const transcript = event.results?.[0]?.[0]?.transcript?.trim() || "";
+      const transcript = Array.from(event.results || [])
+        .slice(event.resultIndex || 0)
+        .filter((result) => result.isFinal)
+        .map((result) => result[0]?.transcript?.trim() || "")
+        .filter(Boolean)
+        .join(" ")
+        .trim();
 
       setVoiceDebug((prev) => ({
         ...prev,
@@ -321,11 +341,11 @@ function AssistantApp() {
       setInput("");
 
       if (assistantModeRef.current) {
-        setVoiceDebug((prev) => ({
-          ...prev,
-          transcriptAutoSent: true,
-        }));
-        handleSendMessageRef.current?.(transcript);
+        appendPendingTranscript(transcript);
+
+        if (!vadEnabledRef.current) {
+          scheduleFallbackTurnCompletion();
+        }
       } else {
         setInput((prev) => (prev ? `${prev} ${transcript}` : transcript));
       }
@@ -344,9 +364,9 @@ function AssistantApp() {
           setError(
             "Microphone access is blocked. Allow microphone permission in your browser."
           );
-        } else if (event.error === "no-speech") {
+        } else if (event.error === "no-speech" && !assistantModeRef.current) {
           setError("I could not hear anything. Check your microphone permission.");
-        } else {
+        } else if (event.error !== "no-speech") {
           setError(`Microphone error: ${event.error}`);
         }
       }
@@ -373,7 +393,7 @@ function AssistantApp() {
         !loadingRef.current &&
         !speakingRef.current
       ) {
-        scheduleListening(600);
+        scheduleListening(vadEnabledRef.current ? 200 : 600);
       } else if (!loadingRef.current && !speakingRef.current) {
         setStatus("Idle");
       }
@@ -383,9 +403,90 @@ function AssistantApp() {
 
     return () => {
       clearTimeout(restartTimerRef.current);
+      clearTimeout(turnGraceTimerRef.current);
+      clearTimeout(fallbackTurnTimerRef.current);
       recognition.abort();
+      vadRef.current?.destroy?.();
     };
   }, []);
+
+  function appendPendingTranscript(transcript) {
+    pendingTranscriptRef.current = pendingTranscriptRef.current
+      ? `${pendingTranscriptRef.current} ${transcript}`.trim()
+      : transcript.trim();
+  }
+
+  function scheduleTurnCompletion(delay = TURN_END_GRACE_MS) {
+    clearTimeout(turnGraceTimerRef.current);
+    setStatus("Waiting for you to finish");
+
+    turnGraceTimerRef.current = setTimeout(() => {
+      if (speechActiveRef.current || loadingRef.current || speakingRef.current) {
+        return;
+      }
+
+      const transcript = pendingTranscriptRef.current.trim();
+      pendingTranscriptRef.current = "";
+
+      if (!transcript) {
+        setStatus("Listening");
+        return;
+      }
+
+      setVoiceDebug((prev) => ({
+        ...prev,
+        transcriptAutoSent: true,
+      }));
+      handleSendMessageRef.current?.(transcript);
+    }, delay);
+  }
+
+  function scheduleFallbackTurnCompletion() {
+    clearTimeout(fallbackTurnTimerRef.current);
+    setStatus("Waiting for you to finish");
+
+    fallbackTurnTimerRef.current = setTimeout(() => {
+      const transcript = pendingTranscriptRef.current.trim();
+      pendingTranscriptRef.current = "";
+
+      if (!assistantModeRef.current || loadingRef.current || speakingRef.current) {
+        return;
+      }
+
+      if (!transcript) {
+        setStatus("Listening");
+        return;
+      }
+
+      setVoiceDebug((prev) => ({
+        ...prev,
+        transcriptAutoSent: true,
+      }));
+      handleSendMessageRef.current?.(transcript);
+    }, FALLBACK_SILENCE_DELAY_MS);
+  }
+
+  function handleSpeechStart() {
+    clearTimeout(turnGraceTimerRef.current);
+    clearTimeout(fallbackTurnTimerRef.current);
+    speechActiveRef.current = true;
+    setStatus("Speaking detected");
+
+    if (speakingRef.current) {
+      stopSpeaking();
+      scheduleListening(50);
+    }
+  }
+
+  function handleSpeechEnd() {
+    speechActiveRef.current = false;
+
+    if (!assistantModeRef.current || loadingRef.current || speakingRef.current) {
+      return;
+    }
+
+    scheduleTurnCompletion();
+  }
 
   function scheduleListening(delay = 600) {
     clearTimeout(restartTimerRef.current);
@@ -405,7 +506,7 @@ function AssistantApp() {
     if (
       !speechSupported ||
       listeningRef.current ||
-      speakingRef.current ||
+      (speakingRef.current && !assistantModeRef.current) ||
       loadingRef.current ||
       conversationLoadingRef.current
     ) {
@@ -438,6 +539,86 @@ function AssistantApp() {
     setListening(false);
   }
 
+  async function ensureVad() {
+    if (vadRef.current || vadLoadingRef.current || vadStatus === "failed") {
+      return vadRef.current;
+    }
+
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setVadStatus("failed");
+      return null;
+    }
+
+    vadLoadingRef.current = true;
+    setVadStatus("loading");
+
+    try {
+      const { MicVAD } = await import("@ricky0123/vad-web");
+      const vad = await MicVAD.new({
+        baseAssetPath: "/vad/",
+        onnxWASMBasePath: "/vad/",
+        model: "v5",
+        startOnLoad: false,
+        onSpeechStart: handleSpeechStart,
+        onSpeechEnd: handleSpeechEnd,
+        onVADMisfire: handleSpeechEnd,
+      });
+
+      vadRef.current = vad;
+      vadEnabledRef.current = true;
+      setVadStatus("loaded");
+      return vad;
+    } catch (err) {
+      console.warn("VAD failed to load; using SpeechRecognition fallback.", err);
+      vadEnabledRef.current = false;
+      setVadStatus("failed");
+      return null;
+    } finally {
+      vadLoadingRef.current = false;
+    }
+  }
+
+  async function startVad() {
+    const vad = await ensureVad();
+
+    if (!vad || !assistantModeRef.current) {
+      return false;
+    }
+
+    try {
+      await vad.start();
+      vadEnabledRef.current = true;
+      setVadStatus("loaded");
+      return true;
+    } catch (err) {
+      console.warn("VAD failed to start; using SpeechRecognition fallback.", err);
+      vadEnabledRef.current = false;
+      setVadStatus("failed");
+      return false;
+    }
+  }
+
+  function stopVad() {
+    try {
+      vadRef.current?.pause?.();
+    } catch (err) {
+      console.warn("VAD failed to pause.", err);
+    }
+
+    vadEnabledRef.current = false;
+  }
+
+  function stopSpeaking() {
+    if (!speakingRef.current) return;
+
+    speakingRef.current = false;
+    setSpeaking(false);
+    setStatus("Listening");
+    window.speechSynthesis?.cancel();
+    speakingResolveRef.current?.();
+    speakingResolveRef.current = null;
+  }
+
   function speak(text) {
     return new Promise((resolve) => {
       if (!ttsSupported || !speakRepliesRef.current) {
@@ -445,11 +626,27 @@ function AssistantApp() {
         return;
       }
 
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        speakingResolveRef.current = null;
+        speakingRef.current = false;
+        setSpeaking(false);
+        setStatus(assistantModeRef.current ? "Listening" : "Idle");
+        resolve();
+
+        if (assistantModeRef.current) {
+          scheduleListening(300);
+        }
+      };
+
       speakingRef.current = true;
       setSpeaking(true);
-      setStatus("Speaking...");
+      setStatus("Speaking");
       stopListening();
       window.speechSynthesis.cancel();
+      speakingResolveRef.current = finish;
 
       const utterance = new SpeechSynthesisUtterance(text);
       const selectedVoice =
@@ -467,21 +664,11 @@ function AssistantApp() {
       utterance.volume = 1;
 
       utterance.onend = () => {
-        speakingRef.current = false;
-        setSpeaking(false);
-        setStatus("Idle");
-        resolve();
-
-        if (assistantModeRef.current) {
-          scheduleListening(700);
-        }
+        finish();
       };
 
       utterance.onerror = () => {
-        speakingRef.current = false;
-        setSpeaking(false);
-        setStatus("Idle");
-        resolve();
+        finish();
       };
 
       window.speechSynthesis.speak(utterance);
@@ -514,7 +701,12 @@ function AssistantApp() {
     setInput("");
     setLoading(true);
     loadingRef.current = true;
-    setStatus("Thinking…");
+    setStatus("Thinking");
+    clearTimeout(turnGraceTimerRef.current);
+    clearTimeout(fallbackTurnTimerRef.current);
+    pendingTranscriptRef.current = "";
+    speechActiveRef.current = false;
+    setStatus("Thinking");
     stopListening();
 
     const history = messagesRef.current;
@@ -599,10 +791,18 @@ function AssistantApp() {
     if (nextMode) {
       setSpeakReplies(true);
       speakRepliesRef.current = true;
+      pendingTranscriptRef.current = "";
+      speechActiveRef.current = false;
+      await startVad();
       await speak(getAssistantModeGreeting());
       scheduleListening(100);
     } else {
       clearTimeout(restartTimerRef.current);
+      clearTimeout(turnGraceTimerRef.current);
+      clearTimeout(fallbackTurnTimerRef.current);
+      pendingTranscriptRef.current = "";
+      speechActiveRef.current = false;
+      stopVad();
       stopListening();
       window.speechSynthesis?.cancel();
       speakingRef.current = false;
@@ -637,6 +837,10 @@ function AssistantApp() {
     if (loadingRef.current || conversationLoading) return;
 
     clearTimeout(restartTimerRef.current);
+    clearTimeout(turnGraceTimerRef.current);
+    clearTimeout(fallbackTurnTimerRef.current);
+    pendingTranscriptRef.current = "";
+    speechActiveRef.current = false;
     window.speechSynthesis?.cancel();
     stopListening();
     setSpeaking(false);
@@ -668,6 +872,15 @@ function AssistantApp() {
     : assistantMode
     ? "online"
     : "idle";
+  const voiceStateLabel = assistantMode
+    ? status === "Speaking detected" ||
+      status === "Waiting for you to finish" ||
+      status === "Thinking" ||
+      status === "Speaking" ||
+      status === "Listening"
+      ? status
+      : "Listening"
+    : "Turn on Assistant Mode to begin hands-free voice control.";
 
   return (
     <div className="app">
@@ -771,17 +984,7 @@ function AssistantApp() {
 
         <div className="voice-status">
           <h2>{assistantMode ? "Assistant Mode On" : "Assistant Mode Off"}</h2>
-          <p>
-            {assistantMode
-              ? listening
-                ? "Listening"
-                : speaking
-                ? "Speaking"
-                : loading
-                ? "Thinking"
-                : "Ready"
-              : "Turn on Assistant Mode to begin hands-free voice control."}
-          </p>
+          <p>{voiceStateLabel}</p>
         </div>
 
         {showVoiceDebug && (
@@ -793,6 +996,10 @@ function AssistantApp() {
             <div className="voice-debug__row">
               <span>Microphone permission</span>
               <strong>{micPermission}</strong>
+            </div>
+            <div className="voice-debug__row">
+              <span>VAD</span>
+              <strong>{vadStatus}</strong>
             </div>
             <div className="voice-debug__grid">
               <span className={voiceDebug.listeningStarted ? "active" : ""}>
