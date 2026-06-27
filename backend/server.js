@@ -121,25 +121,10 @@ async function checkElevenLabsTtsAvailability() {
     return summarizeService(false, "ElevenLabs API key is not configured.");
   }
 
-  try {
-    const response = await fetch("https://api.elevenlabs.io/v1/user/subscription", {
-      headers: { "xi-api-key": ELEVENLABS_API_KEY },
-    });
-
-    if (!response.ok) {
-      const detail = await response.text().catch(() => response.statusText);
-      return summarizeService(
-        false,
-        isElevenLabsQuotaError(response.status, detail)
-          ? "ElevenLabs TTS quota, credits, plan, or key issue."
-          : "ElevenLabs TTS status check failed."
-      );
-    }
-
-    return summarizeService(true, "ElevenLabs account responded.");
-  } catch (err) {
-    return summarizeService(false, "ElevenLabs TTS status check failed.");
-  }
+  return summarizeService(
+    true,
+    "ElevenLabs TTS is configured. Live TTS requests report quota, plan, key, and credit issues."
+  );
 }
 
 async function checkElevenLabsSttAvailability() {
@@ -147,25 +132,10 @@ async function checkElevenLabsSttAvailability() {
     return summarizeService(false, "ElevenLabs API key is not configured.");
   }
 
-  try {
-    const response = await fetch("https://api.elevenlabs.io/v1/models", {
-      headers: { "xi-api-key": ELEVENLABS_API_KEY },
-    });
-
-    if (!response.ok) {
-      const detail = await response.text().catch(() => response.statusText);
-      return summarizeService(
-        false,
-        isElevenLabsQuotaError(response.status, detail)
-          ? "ElevenLabs STT quota, credits, plan, or key issue."
-          : "ElevenLabs STT status check failed."
-      );
-    }
-
-    return summarizeService(true, "ElevenLabs API responded.");
-  } catch (err) {
-    return summarizeService(false, "ElevenLabs STT status check failed.");
-  }
+  return summarizeService(
+    true,
+    "ElevenLabs STT is configured. Live STT requests report quota, plan, key, and credit issues."
+  );
 }
 
 // Simple health check
