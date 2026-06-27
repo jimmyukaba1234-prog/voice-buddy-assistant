@@ -1,7 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 import { AuthForm } from "./auth/AuthForm.jsx";
 import { useAuth } from "./auth/AuthProvider.jsx";
-import { sendChatMessage, synthesizeSpeech, transcribeSpeech } from "./lib/api.js";
+import {
+  sendChatMessage,
+  streamChatMessage,
+  synthesizeSpeech,
+  transcribeSpeech,
+} from "./lib/api.js";
 import {
   createConversation,
   generateConversationTitle,
@@ -33,8 +38,13 @@ const ttsSupported =
   typeof window !== "undefined" && "speechSynthesis" in window;
 const showVoiceDebug = import.meta.env.VITE_SHOW_VOICE_DEBUG === "true";
 
-const TURN_END_GRACE_MS = 1000;
+const configuredTurnEndGraceMs = Number(import.meta.env.VITE_TURN_END_GRACE_MS);
+const TURN_END_GRACE_MS =
+  Number.isFinite(configuredTurnEndGraceMs) && configuredTurnEndGraceMs >= 500
+    ? configuredTurnEndGraceMs
+    : 1000;
 const FALLBACK_SILENCE_DELAY_MS = 2200;
+const SELF_INTERRUPT_GUARD_MS = 450;
 const BRIDGE_PHRASES = ["On it.", "One moment.", "Let me check."];
 const ASSISTANT_NAME = "Heney";
 const PREFERRED_VOICE_HINTS = [
@@ -140,6 +150,9 @@ function AssistantApp() {
   const recordingStopPromiseRef = useRef(null);
   const ttsAudioRef = useRef(null);
   const ttsAudioUrlRef = useRef("");
+  const ttsAudioRejectRef = useRef(null);
+  const speechAbortRef = useRef(0);
+  const ttsStartedAtRef = useRef(0);
 
   const conversationRef = useRef(conversation);
   const messagesRef = useRef(messages);
@@ -443,7 +456,13 @@ function AssistantApp() {
       return recorderStreamRef.current;
     }
 
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      },
+    });
     recorderStreamRef.current = stream;
     return stream;
   }
@@ -602,12 +621,21 @@ function AssistantApp() {
     clearTimeout(fallbackTurnTimerRef.current);
     speechActiveRef.current = true;
     setStatus("Speaking detected");
-    startTurnRecording();
 
     if (speakingRef.current) {
+      if (Date.now() - ttsStartedAtRef.current < SELF_INTERRUPT_GUARD_MS) {
+        speechActiveRef.current = false;
+        setStatus("Speaking");
+        return;
+      }
+
       stopSpeaking();
+      startTurnRecording();
       scheduleListening(50);
+      return;
     }
+
+    startTurnRecording();
   }
 
   function handleSpeechEnd() {
@@ -692,6 +720,14 @@ function AssistantApp() {
         onnxWASMBasePath: "/vad/",
         model: "v5",
         startOnLoad: false,
+        getStream: () =>
+          navigator.mediaDevices.getUserMedia({
+            audio: {
+              echoCancellation: true,
+              noiseSuppression: true,
+              autoGainControl: true,
+            },
+          }),
         onSpeechStart: handleSpeechStart,
         onSpeechEnd: handleSpeechEnd,
         onVADMisfire: handleSpeechEnd,
@@ -744,9 +780,12 @@ function AssistantApp() {
   function stopSpeaking() {
     if (!speakingRef.current) return;
 
+    speechAbortRef.current += 1;
     speakingRef.current = false;
     setSpeaking(false);
     setStatus("Listening");
+    ttsAudioRejectRef.current?.(new Error("Speech interrupted."));
+    ttsAudioRejectRef.current = null;
     if (ttsAudioRef.current) {
       ttsAudioRef.current.pause();
       ttsAudioRef.current.src = "";
@@ -784,12 +823,71 @@ function AssistantApp() {
     return chunks;
   }
 
-  function playAudioBlob(audioBlob) {
+  function takeCompleteSpeechChunks(buffer, force = false) {
+    const chunks = [];
+    let remaining = buffer.replace(/\s+/g, " ").trimStart();
+    const sentencePattern = /^(.+?[.!?])(\s+|$)/;
+
+    while (true) {
+      const match = remaining.match(sentencePattern);
+      if (!match) break;
+
+      chunks.push(match[1].trim());
+      remaining = remaining.slice(match[0].length).trimStart();
+    }
+
+    if (force && remaining.trim()) {
+      chunks.push(remaining.trim());
+      remaining = "";
+    }
+
+    return { chunks, remaining };
+  }
+
+  function createStreamingSpeaker(waitFor = Promise.resolve()) {
+    let buffer = "";
+    let chain = Promise.resolve(waitFor).catch((err) => {
+      console.warn("Bridge speech failed before streamed speech.", err);
+    });
+    const speechRunId = speechAbortRef.current;
+
+    function enqueueChunk(chunk) {
+      if (!chunk || speechRunId !== speechAbortRef.current) return;
+
+      chain = chain.then(async () => {
+        if (speechRunId !== speechAbortRef.current) return;
+        await speak(chunk, { chunked: false, resumeListening: false });
+      });
+    }
+
+    return {
+      push(text) {
+        buffer += text || "";
+        const result = takeCompleteSpeechChunks(buffer);
+        buffer = result.remaining;
+        result.chunks.forEach(enqueueChunk);
+      },
+      async finish() {
+        const result = takeCompleteSpeechChunks(buffer, true);
+        buffer = result.remaining;
+        result.chunks.forEach(enqueueChunk);
+        await chain;
+      },
+    };
+  }
+
+  function playAudioBlob(audioBlob, speechRunId) {
     return new Promise((resolve, reject) => {
+      if (speechRunId !== speechAbortRef.current) {
+        reject(new Error("Speech interrupted."));
+        return;
+      }
+
       const audioUrl = URL.createObjectURL(audioBlob);
       const audio = new Audio(audioUrl);
       ttsAudioRef.current = audio;
       ttsAudioUrlRef.current = audioUrl;
+      ttsAudioRejectRef.current = reject;
 
       const cleanup = () => {
         if (ttsAudioUrlRef.current === audioUrl) {
@@ -798,6 +896,9 @@ function AssistantApp() {
         }
         if (ttsAudioRef.current === audio) {
           ttsAudioRef.current = null;
+        }
+        if (ttsAudioRejectRef.current === reject) {
+          ttsAudioRejectRef.current = null;
         }
       };
 
@@ -867,14 +968,16 @@ function AssistantApp() {
         setStatus(assistantModeRef.current ? "Listening" : "Idle");
         resolve();
 
-        if (assistantModeRef.current) {
+        if (assistantModeRef.current && options.resumeListening !== false) {
           scheduleListening(300);
         }
       };
 
+      const speechRunId = speechAbortRef.current;
       speakingRef.current = true;
       setSpeaking(true);
       setStatus("Speaking");
+      ttsStartedAtRef.current = Date.now();
       stopListening();
       window.speechSynthesis.cancel();
       speakingResolveRef.current = finish;
@@ -883,16 +986,17 @@ function AssistantApp() {
         const chunks = options.chunked === false ? [text] : splitSpeechChunks(text);
 
         for (const chunk of chunks) {
-          if (settled) return;
+          if (settled || speechRunId !== speechAbortRef.current) return;
           const audioBlob = await synthesizeSpeech(chunk);
-          if (settled) return;
-          await playAudioBlob(audioBlob);
+          if (settled || speechRunId !== speechAbortRef.current) return;
+          await playAudioBlob(audioBlob, speechRunId);
         }
 
         finish();
         return;
       } catch (err) {
         if (settled) return;
+        if (speechRunId !== speechAbortRef.current) return;
         console.warn("ElevenLabs chunked TTS failed; using browser speech fallback.", err);
       }
 
@@ -900,7 +1004,7 @@ function AssistantApp() {
     });
   }
 
-  async function saveAndSpeakAssistantReply(activeConversation, reply) {
+  async function saveAssistantReply(activeConversation, reply) {
     const assistantMessage = await saveMessage(
       user.id,
       activeConversation.id,
@@ -914,7 +1018,11 @@ function AssistantApp() {
     });
     setConversation(updatedConversation);
     conversationRef.current = updatedConversation;
+    return assistantMessage;
+  }
 
+  async function saveAndSpeakAssistantReply(activeConversation, reply) {
+    await saveAssistantReply(activeConversation, reply);
     await speak(reply);
   }
 
@@ -925,7 +1033,7 @@ function AssistantApp() {
       BRIDGE_PHRASES[Math.floor(Math.random() * BRIDGE_PHRASES.length)];
 
     try {
-      await speak(phrase, { chunked: false });
+      await speak(phrase, { chunked: false, resumeListening: false });
     } catch (err) {
       console.warn("Bridge speech failed.", err);
     }
@@ -993,10 +1101,9 @@ function AssistantApp() {
         return;
       }
 
-      if (voiceMode) {
-        await speakBridgePhrase();
-        setStatus("Thinking");
-      }
+      const bridgePromise = voiceMode
+        ? speakBridgePhrase().finally(() => setStatus("Thinking"))
+        : Promise.resolve();
 
       let memoryContext = "";
 
@@ -1008,10 +1115,48 @@ function AssistantApp() {
         console.warn("Memory service error:", memoryError);
       }
 
-      const reply = await sendChatMessage(cleanText, history, memoryContext, {
-        voiceMode,
-      });
-      await saveAndSpeakAssistantReply(activeConversation, reply);
+      let reply = "";
+
+      if (voiceMode) {
+        const streamingSpeaker = createStreamingSpeaker(bridgePromise);
+
+        try {
+          reply = await streamChatMessage(
+            cleanText,
+            history,
+            memoryContext,
+            { voiceMode: true },
+            (chunk) => {
+              reply += chunk;
+              streamingSpeaker.push(chunk);
+            }
+          );
+          await streamingSpeaker.finish();
+          await saveAssistantReply(activeConversation, reply);
+        } catch (streamError) {
+          console.warn("Gemini stream failed; using /api/chat fallback.", streamError);
+
+          if (!reply.trim()) {
+            reply = await sendChatMessage(cleanText, history, memoryContext, {
+              voiceMode: true,
+            });
+            await bridgePromise;
+            await saveAndSpeakAssistantReply(activeConversation, reply);
+          } else {
+            await streamingSpeaker.finish();
+            await saveAssistantReply(activeConversation, reply);
+          }
+        }
+      } else {
+        try {
+          reply = await streamChatMessage(cleanText, history, memoryContext);
+        } catch (streamError) {
+          console.warn("Gemini stream failed; using /api/chat fallback.", streamError);
+          reply = await sendChatMessage(cleanText, history, memoryContext);
+        }
+
+        await saveAndSpeakAssistantReply(activeConversation, reply);
+      }
     } catch (err) {
       setError(err.message || "Something went wrong.");
       setStatus("Idle");

@@ -32,6 +32,60 @@ export async function sendChatMessage(
   return data.reply;
 }
 
+export async function streamChatMessage(
+  message,
+  history,
+  memoryContext = "",
+  options = {},
+  onChunk = () => {}
+) {
+  const res = await fetch(apiUrl("/api/chat/stream"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      message,
+      history,
+      memoryContext,
+      voiceMode: options.voiceMode === true,
+    }),
+  });
+
+  if (!res.ok || !res.body) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || `Stream request failed (${res.status})`);
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let reply = "";
+
+  while (true) {
+    const { value, done } = await reader.read();
+    buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
+
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      const event = JSON.parse(line);
+
+      if (event.type === "chunk") {
+        reply += event.text || "";
+        onChunk(event.text || "");
+      } else if (event.type === "done") {
+        return event.reply || reply;
+      } else if (event.type === "error") {
+        throw new Error(event.error || "Stream failed.");
+      }
+    }
+
+    if (done) break;
+  }
+
+  return reply;
+}
+
 export async function reviewMessageForMemory(message, candidates = []) {
   const res = await fetch(apiUrl("/api/memory-review"), {
     method: "POST",

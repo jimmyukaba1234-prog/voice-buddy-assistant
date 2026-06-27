@@ -299,6 +299,56 @@ function isGeminiQuotaError(err) {
   );
 }
 
+function buildChatRequest(body = {}) {
+  const {
+    message,
+    history = [],
+    memoryContext = "",
+    voiceMode = false,
+  } = body || {};
+
+  if (!message || typeof message !== "string" || !message.trim()) {
+    const err = new Error("A non-empty 'message' is required.");
+    err.status = 400;
+    throw err;
+  }
+
+  const contents = [
+    ...history
+      .filter((m) => m && typeof m.text === "string" && m.text.trim())
+      .map((m) => ({
+        role: m.role === "assistant" ? "model" : "user",
+        parts: [{ text: m.text }],
+      })),
+    { role: "user", parts: [{ text: message }] },
+  ];
+
+  const memoryInstruction =
+    typeof memoryContext === "string" && memoryContext.trim()
+      ? "\n\nLong-term memories about the user:\n" +
+        memoryContext.trim() +
+        "\nUse long-term memories naturally when they are relevant. " +
+        "Do not mention memory records unless the user explicitly asks. " +
+        "If the user asks what you remember, summarize naturally. " +
+        "Never say 'according to your stored memory' unless necessary."
+      : "";
+  const voiceInstruction = voiceMode
+    ? " Voice mode is active: answer in 1 to 3 short, natural sentences unless the user asks for details. Avoid long bullet lists, tables, and dense formatting."
+    : "";
+
+  return {
+    model: GEMINI_MODEL,
+    contents,
+    config: {
+      systemInstruction:
+        "You are Heney, a friendly and concise personal voice assistant. " +
+        "Keep answers natural and easy to read aloud. Avoid heavy markdown formatting." +
+        voiceInstruction +
+        memoryInstruction,
+    },
+  };
+}
+
 /**
  * POST /api/memory-review
  * Body: { message: string, candidates?: [{ key, value, confidence, metadata }] }
@@ -393,52 +443,7 @@ app.post("/api/chat", async (req, res) => {
         .json({ error: "Server is missing GEMINI_API_KEY." });
     }
 
-    const {
-      message,
-      history = [],
-      memoryContext = "",
-      voiceMode = false,
-    } = req.body || {};
-
-    if (!message || typeof message !== "string" || !message.trim()) {
-      return res.status(400).json({ error: "A non-empty 'message' is required." });
-    }
-
-    // Convert chat history into Gemini's content format.
-    const contents = [
-      ...history
-        .filter((m) => m && typeof m.text === "string" && m.text.trim())
-        .map((m) => ({
-          role: m.role === "assistant" ? "model" : "user",
-          parts: [{ text: m.text }],
-        })),
-      { role: "user", parts: [{ text: message }] },
-    ];
-
-    const memoryInstruction =
-      typeof memoryContext === "string" && memoryContext.trim()
-        ? "\n\nLong-term memories about the user:\n" +
-          memoryContext.trim() +
-          "\nUse long-term memories naturally when they are relevant. " +
-          "Do not mention memory records unless the user explicitly asks. " +
-          "If the user asks what you remember, summarize naturally. " +
-          "Never say 'according to your stored memory' unless necessary."
-        : "";
-    const voiceInstruction = voiceMode
-      ? " Voice mode is active: answer in 1 to 3 short, natural sentences unless the user asks for details. Avoid long bullet lists, tables, and dense formatting."
-      : "";
-
-    const response = await ai.models.generateContent({
-      model: GEMINI_MODEL,
-      contents,
-      config: {
-        systemInstruction:
-          "You are Heney, a friendly and concise personal voice assistant. " +
-          "Keep answers natural and easy to read aloud. Avoid heavy markdown formatting." +
-          voiceInstruction +
-          memoryInstruction,
-      },
-    });
+    const response = await ai.models.generateContent(buildChatRequest(req.body));
 
     const reply = response.text?.trim();
 
@@ -461,8 +466,66 @@ app.post("/api/chat", async (req, res) => {
     }
 
     res
-      .status(500)
+      .status(err.status || 500)
       .json({ error: "Failed to get a response from Gemini.", detail: err.message });
+  }
+});
+
+app.post("/api/chat/stream", async (req, res) => {
+  try {
+    if (!GEMINI_API_KEY) {
+      return res
+        .status(500)
+        .json({ error: "Server is missing GEMINI_API_KEY." });
+    }
+
+    res.setHeader("Content-Type", "application/x-ndjson; charset=utf-8");
+    res.setHeader("Cache-Control", "no-cache, no-transform");
+    res.setHeader("X-Accel-Buffering", "no");
+    res.flushHeaders?.();
+
+    const response = await ai.models.generateContentStream(buildChatRequest(req.body));
+    let fullText = "";
+
+    for await (const chunk of response) {
+      const text = chunk.text || "";
+      if (!text) continue;
+
+      fullText += text;
+      res.write(`${JSON.stringify({ type: "chunk", text })}\n`);
+    }
+
+    res.write(`${JSON.stringify({ type: "done", reply: fullText.trim() })}\n`);
+    res.end();
+  } catch (err) {
+    console.error("[voice-buddy] /api/chat/stream error:", err);
+
+    if (isGeminiQuotaError(err)) {
+      res.write(
+        `${JSON.stringify({
+          type: "done",
+          reply: GEMINI_QUOTA_MESSAGE,
+          degraded: true,
+          reason: "gemini-quota",
+        })}\n`
+      );
+      return res.end();
+    }
+
+    if (!res.headersSent) {
+      return res
+        .status(err.status || 500)
+        .json({ error: "Failed to stream a response from Gemini.", detail: err.message });
+    }
+
+    res.write(
+      `${JSON.stringify({
+        type: "error",
+        error: "Failed to stream a response from Gemini.",
+        detail: err.message,
+      })}\n`
+    );
+    res.end();
   }
 });
 
