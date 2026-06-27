@@ -6,11 +6,21 @@ export function apiUrl(path) {
 }
 
 // Sends the current message plus history to the backend and returns the reply text.
-export async function sendChatMessage(message, history, memoryContext = "") {
+export async function sendChatMessage(
+  message,
+  history,
+  memoryContext = "",
+  options = {}
+) {
   const res = await fetch(apiUrl("/api/chat"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ message, history, memoryContext }),
+    body: JSON.stringify({
+      message,
+      history,
+      memoryContext,
+      voiceMode: options.voiceMode === true,
+    }),
   });
 
   const data = await res.json().catch(() => ({}));

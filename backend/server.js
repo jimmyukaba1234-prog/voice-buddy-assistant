@@ -380,7 +380,8 @@ app.post("/api/memory-review", async (req, res) => {
  * Body: {
  *   message: string,
  *   history?: [{ role: "user" | "assistant", text: string }],
- *   memoryContext?: string
+ *   memoryContext?: string,
+ *   voiceMode?: boolean
  * }
  * Returns: { reply: string }
  */
@@ -392,7 +393,12 @@ app.post("/api/chat", async (req, res) => {
         .json({ error: "Server is missing GEMINI_API_KEY." });
     }
 
-    const { message, history = [], memoryContext = "" } = req.body || {};
+    const {
+      message,
+      history = [],
+      memoryContext = "",
+      voiceMode = false,
+    } = req.body || {};
 
     if (!message || typeof message !== "string" || !message.trim()) {
       return res.status(400).json({ error: "A non-empty 'message' is required." });
@@ -418,6 +424,9 @@ app.post("/api/chat", async (req, res) => {
           "If the user asks what you remember, summarize naturally. " +
           "Never say 'according to your stored memory' unless necessary."
         : "";
+    const voiceInstruction = voiceMode
+      ? " Voice mode is active: answer in 1 to 3 short, natural sentences unless the user asks for details. Avoid long bullet lists, tables, and dense formatting."
+      : "";
 
     const response = await ai.models.generateContent({
       model: GEMINI_MODEL,
@@ -426,6 +435,7 @@ app.post("/api/chat", async (req, res) => {
         systemInstruction:
           "You are Heney, a friendly and concise personal voice assistant. " +
           "Keep answers natural and easy to read aloud. Avoid heavy markdown formatting." +
+          voiceInstruction +
           memoryInstruction,
       },
     });

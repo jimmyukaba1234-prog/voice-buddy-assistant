@@ -35,6 +35,7 @@ const showVoiceDebug = import.meta.env.VITE_SHOW_VOICE_DEBUG === "true";
 
 const TURN_END_GRACE_MS = 1000;
 const FALLBACK_SILENCE_DELAY_MS = 2200;
+const BRIDGE_PHRASES = ["On it.", "One moment.", "Let me check."];
 const ASSISTANT_NAME = "Heney";
 const PREFERRED_VOICE_HINTS = [
   "natural",
@@ -555,7 +556,7 @@ function AssistantApp() {
       ...prev,
       transcriptAutoSent: true,
     }));
-    handleSendMessageRef.current?.(transcript);
+    handleSendMessageRef.current?.(transcript, { voiceMode: true });
   }
 
   function scheduleTurnCompletion(delay = TURN_END_GRACE_MS) {
@@ -592,7 +593,7 @@ function AssistantApp() {
         ...prev,
         transcriptAutoSent: true,
       }));
-      handleSendMessageRef.current?.(transcript);
+      handleSendMessageRef.current?.(transcript, { voiceMode: true });
     }, FALLBACK_SILENCE_DELAY_MS);
   }
 
@@ -760,7 +761,96 @@ function AssistantApp() {
     speakingResolveRef.current = null;
   }
 
-  function speak(text) {
+  function splitSpeechChunks(text) {
+    const normalized = text.replace(/\s+/g, " ").trim();
+    if (!normalized) return [];
+
+    const sentences = normalized.match(/[^.!?]+[.!?]+|[^.!?]+$/g) || [normalized];
+    const chunks = [];
+    let current = "";
+
+    for (const sentence of sentences.map((item) => item.trim()).filter(Boolean)) {
+      const next = current ? `${current} ${sentence}` : sentence;
+
+      if (next.length > 220 && current) {
+        chunks.push(current);
+        current = sentence;
+      } else {
+        current = next;
+      }
+    }
+
+    if (current) chunks.push(current);
+    return chunks;
+  }
+
+  function playAudioBlob(audioBlob) {
+    return new Promise((resolve, reject) => {
+      const audioUrl = URL.createObjectURL(audioBlob);
+      const audio = new Audio(audioUrl);
+      ttsAudioRef.current = audio;
+      ttsAudioUrlRef.current = audioUrl;
+
+      const cleanup = () => {
+        if (ttsAudioUrlRef.current === audioUrl) {
+          URL.revokeObjectURL(audioUrl);
+          ttsAudioUrlRef.current = "";
+        }
+        if (ttsAudioRef.current === audio) {
+          ttsAudioRef.current = null;
+        }
+      };
+
+      audio.onended = () => {
+        cleanup();
+        resolve();
+      };
+
+      audio.onerror = () => {
+        cleanup();
+        reject(new Error("ElevenLabs audio playback failed."));
+      };
+
+      audio.play().catch((err) => {
+        cleanup();
+        reject(err);
+      });
+    });
+  }
+
+  function speakWithBrowser(text, finish) {
+    if (!ttsSupported) {
+      finish();
+      return;
+    }
+
+    const utterance = new SpeechSynthesisUtterance(text);
+    const selectedVoice =
+      voicesRef.current.find(
+        (voice) => voice.voiceURI === selectedVoiceURIRef.current
+      ) || findPreferredVoice(voicesRef.current);
+
+    if (selectedVoice) {
+      utterance.voice = selectedVoice;
+    }
+
+    utterance.lang = "en-US";
+    utterance.rate = 0.9;
+    utterance.pitch = 1.0;
+    utterance.volume = 1;
+
+    utterance.onend = () => {
+      finish();
+    };
+
+    utterance.onerror = () => {
+      finish();
+    };
+
+    window.speechSynthesis.speak(utterance);
+  }
+
+  function speak(text, options = {}) {
     return new Promise(async (resolve) => {
       if (!speakRepliesRef.current) {
         resolve();
@@ -789,74 +879,24 @@ function AssistantApp() {
       window.speechSynthesis.cancel();
       speakingResolveRef.current = finish;
 
-      const playBrowserSpeech = () => {
-        if (!ttsSupported) {
-          finish();
-          return;
-        }
-
-        const utterance = new SpeechSynthesisUtterance(text);
-        const selectedVoice =
-          voicesRef.current.find(
-            (voice) => voice.voiceURI === selectedVoiceURIRef.current
-          ) || findPreferredVoice(voicesRef.current);
-
-        if (selectedVoice) {
-          utterance.voice = selectedVoice;
-        }
-
-        utterance.lang = "en-US";
-        utterance.rate = 0.9;
-        utterance.pitch = 1.0;
-        utterance.volume = 1;
-
-        utterance.onend = () => {
-          finish();
-        };
-
-        utterance.onerror = () => {
-          finish();
-        };
-
-        window.speechSynthesis.speak(utterance);
-      };
-
       try {
-        const audioBlob = await synthesizeSpeech(text);
-        if (settled) return;
+        const chunks = options.chunked === false ? [text] : splitSpeechChunks(text);
 
-        const audioUrl = URL.createObjectURL(audioBlob);
-        const audio = new Audio(audioUrl);
-        ttsAudioRef.current = audio;
-        ttsAudioUrlRef.current = audioUrl;
+        for (const chunk of chunks) {
+          if (settled) return;
+          const audioBlob = await synthesizeSpeech(chunk);
+          if (settled) return;
+          await playAudioBlob(audioBlob);
+        }
 
-        audio.onended = () => {
-          if (ttsAudioUrlRef.current) {
-            URL.revokeObjectURL(ttsAudioUrlRef.current);
-            ttsAudioUrlRef.current = "";
-          }
-          ttsAudioRef.current = null;
-          finish();
-        };
-
-        audio.onerror = () => {
-          if (ttsAudioUrlRef.current) {
-            URL.revokeObjectURL(ttsAudioUrlRef.current);
-            ttsAudioUrlRef.current = "";
-          }
-          ttsAudioRef.current = null;
-          console.warn("ElevenLabs audio playback failed; using browser speech fallback.");
-          playBrowserSpeech();
-        };
-
-        await audio.play();
+        finish();
         return;
       } catch (err) {
         if (settled) return;
-        console.warn("ElevenLabs TTS failed; using browser speech fallback.", err);
+        console.warn("ElevenLabs chunked TTS failed; using browser speech fallback.", err);
       }
 
-      playBrowserSpeech();
+      speakWithBrowser(text, finish);
     });
   }
 
@@ -878,9 +918,23 @@ function AssistantApp() {
     await speak(reply);
   }
 
-  async function handleSendMessage(text) {
+  async function speakBridgePhrase() {
+    if (!assistantModeRef.current || !speakRepliesRef.current) return;
+
+    const phrase =
+      BRIDGE_PHRASES[Math.floor(Math.random() * BRIDGE_PHRASES.length)];
+
+    try {
+      await speak(phrase, { chunked: false });
+    } catch (err) {
+      console.warn("Bridge speech failed.", err);
+    }
+  }
+
+  async function handleSendMessage(text, options = {}) {
     const cleanText = text.trim();
     if (!cleanText || loadingRef.current || conversationLoading) return;
+    const voiceMode = options.voiceMode === true;
 
     setError("");
     setInput("");
@@ -939,6 +993,11 @@ function AssistantApp() {
         return;
       }
 
+      if (voiceMode) {
+        await speakBridgePhrase();
+        setStatus("Thinking");
+      }
+
       let memoryContext = "";
 
       try {
@@ -949,7 +1008,9 @@ function AssistantApp() {
         console.warn("Memory service error:", memoryError);
       }
 
-      const reply = await sendChatMessage(cleanText, history, memoryContext);
+      const reply = await sendChatMessage(cleanText, history, memoryContext, {
+        voiceMode,
+      });
       await saveAndSpeakAssistantReply(activeConversation, reply);
     } catch (err) {
       setError(err.message || "Something went wrong.");
