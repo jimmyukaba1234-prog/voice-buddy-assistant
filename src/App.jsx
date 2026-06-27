@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { AuthForm } from "./auth/AuthForm.jsx";
 import { useAuth } from "./auth/AuthProvider.jsx";
-import { sendChatMessage } from "./lib/api.js";
+import { sendChatMessage, synthesizeSpeech, transcribeSpeech } from "./lib/api.js";
 import {
   createConversation,
   generateConversationTitle,
@@ -131,6 +131,14 @@ function AssistantApp() {
   const vadEnabledRef = useRef(false);
   const vadLoadingRef = useRef(false);
   const speakingResolveRef = useRef(null);
+  const recorderStreamRef = useRef(null);
+  const mediaRecorderRef = useRef(null);
+  const audioChunksRef = useRef([]);
+  const completedAudioBlobsRef = useRef([]);
+  const recordedAudioBlobRef = useRef(null);
+  const recordingStopPromiseRef = useRef(null);
+  const ttsAudioRef = useRef(null);
+  const ttsAudioUrlRef = useRef("");
 
   const conversationRef = useRef(conversation);
   const messagesRef = useRef(messages);
@@ -407,6 +415,7 @@ function AssistantApp() {
       clearTimeout(fallbackTurnTimerRef.current);
       recognition.abort();
       vadRef.current?.destroy?.();
+      releaseRecorderStream();
     };
   }, []);
 
@@ -414,6 +423,139 @@ function AssistantApp() {
     pendingTranscriptRef.current = pendingTranscriptRef.current
       ? `${pendingTranscriptRef.current} ${transcript}`.trim()
       : transcript.trim();
+  }
+
+  function preferredAudioMimeType() {
+    if (typeof MediaRecorder === "undefined") return "";
+
+    const candidates = [
+      "audio/webm;codecs=opus",
+      "audio/webm",
+      "audio/mp4",
+    ];
+
+    return candidates.find((type) => MediaRecorder.isTypeSupported(type)) || "";
+  }
+
+  async function getRecorderStream() {
+    if (recorderStreamRef.current?.active) {
+      return recorderStreamRef.current;
+    }
+
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    recorderStreamRef.current = stream;
+    return stream;
+  }
+
+  async function startTurnRecording() {
+    if (typeof MediaRecorder === "undefined" || !navigator.mediaDevices?.getUserMedia) {
+      return;
+    }
+
+    try {
+      const stream = await getRecorderStream();
+      const mimeType = preferredAudioMimeType();
+      const recorder = new MediaRecorder(
+        stream,
+        mimeType ? { mimeType } : undefined
+      );
+
+      audioChunksRef.current = [];
+      recordedAudioBlobRef.current = null;
+      recordingStopPromiseRef.current = new Promise((resolve) => {
+        recorder.ondataavailable = (event) => {
+          if (event.data?.size) {
+            audioChunksRef.current.push(event.data);
+          }
+        };
+
+        recorder.onstop = () => {
+          const type = recorder.mimeType || mimeType || "audio/webm";
+          recordedAudioBlobRef.current = audioChunksRef.current.length
+            ? new Blob(audioChunksRef.current, { type })
+            : null;
+          if (recordedAudioBlobRef.current?.size) {
+            completedAudioBlobsRef.current.push(recordedAudioBlobRef.current);
+          }
+          resolve(recordedAudioBlobRef.current);
+        };
+
+        recorder.onerror = () => resolve(null);
+      });
+
+      mediaRecorderRef.current = recorder;
+      recorder.start();
+    } catch (err) {
+      console.warn("ElevenLabs recorder failed to start; STT fallback may be used.", err);
+    }
+  }
+
+  function stopTurnRecording() {
+    const recorder = mediaRecorderRef.current;
+
+    if (recorder?.state === "recording") {
+      try {
+        recorder.stop();
+      } catch (err) {
+        console.warn("ElevenLabs recorder failed to stop.", err);
+      }
+    }
+  }
+
+  async function getRecordedAudioBlob() {
+    if (recordingStopPromiseRef.current) {
+      await recordingStopPromiseRef.current.catch(() => null);
+    }
+
+    return recordedAudioBlobRef.current;
+  }
+
+  function releaseRecorderStream() {
+    recorderStreamRef.current?.getTracks?.().forEach((track) => track.stop());
+    recorderStreamRef.current = null;
+    mediaRecorderRef.current = null;
+  }
+
+  async function resolveVoiceTranscript() {
+    const fallbackTranscript = pendingTranscriptRef.current.trim();
+    await getRecordedAudioBlob();
+    const audioBlobs = completedAudioBlobsRef.current.filter((blob) => blob?.size);
+    const audioType = audioBlobs[0]?.type || "audio/webm";
+    const audioBlob = audioBlobs.length
+      ? new Blob(audioBlobs, { type: audioType })
+      : null;
+    pendingTranscriptRef.current = "";
+    completedAudioBlobsRef.current = [];
+    recordedAudioBlobRef.current = null;
+    recordingStopPromiseRef.current = null;
+
+    if (audioBlob?.size) {
+      try {
+        const transcript = await transcribeSpeech(audioBlob);
+        if (transcript.trim()) {
+          return transcript.trim();
+        }
+      } catch (err) {
+        console.warn("ElevenLabs STT failed; using browser SpeechRecognition fallback.", err);
+      }
+    }
+
+    return fallbackTranscript;
+  }
+
+  async function submitCompletedVoiceTurn() {
+    const transcript = await resolveVoiceTranscript();
+
+    if (!transcript) {
+      setStatus("Listening");
+      return;
+    }
+
+    setVoiceDebug((prev) => ({
+      ...prev,
+      transcriptAutoSent: true,
+    }));
+    handleSendMessageRef.current?.(transcript);
   }
 
   function scheduleTurnCompletion(delay = TURN_END_GRACE_MS) {
@@ -425,19 +567,7 @@ function AssistantApp() {
         return;
       }
 
-      const transcript = pendingTranscriptRef.current.trim();
-      pendingTranscriptRef.current = "";
-
-      if (!transcript) {
-        setStatus("Listening");
-        return;
-      }
-
-      setVoiceDebug((prev) => ({
-        ...prev,
-        transcriptAutoSent: true,
-      }));
-      handleSendMessageRef.current?.(transcript);
+      submitCompletedVoiceTurn();
     }, delay);
   }
 
@@ -471,6 +601,7 @@ function AssistantApp() {
     clearTimeout(fallbackTurnTimerRef.current);
     speechActiveRef.current = true;
     setStatus("Speaking detected");
+    startTurnRecording();
 
     if (speakingRef.current) {
       stopSpeaking();
@@ -485,6 +616,7 @@ function AssistantApp() {
       return;
     }
 
+    stopTurnRecording();
     scheduleTurnCompletion();
   }
 
@@ -614,14 +746,23 @@ function AssistantApp() {
     speakingRef.current = false;
     setSpeaking(false);
     setStatus("Listening");
+    if (ttsAudioRef.current) {
+      ttsAudioRef.current.pause();
+      ttsAudioRef.current.src = "";
+      ttsAudioRef.current = null;
+    }
+    if (ttsAudioUrlRef.current) {
+      URL.revokeObjectURL(ttsAudioUrlRef.current);
+      ttsAudioUrlRef.current = "";
+    }
     window.speechSynthesis?.cancel();
     speakingResolveRef.current?.();
     speakingResolveRef.current = null;
   }
 
   function speak(text) {
-    return new Promise((resolve) => {
-      if (!ttsSupported || !speakRepliesRef.current) {
+    return new Promise(async (resolve) => {
+      if (!speakRepliesRef.current) {
         resolve();
         return;
       }
@@ -648,30 +789,74 @@ function AssistantApp() {
       window.speechSynthesis.cancel();
       speakingResolveRef.current = finish;
 
-      const utterance = new SpeechSynthesisUtterance(text);
-      const selectedVoice =
-        voicesRef.current.find(
-          (voice) => voice.voiceURI === selectedVoiceURIRef.current
-        ) || findPreferredVoice(voicesRef.current);
+      const playBrowserSpeech = () => {
+        if (!ttsSupported) {
+          finish();
+          return;
+        }
 
-      if (selectedVoice) {
-        utterance.voice = selectedVoice;
+        const utterance = new SpeechSynthesisUtterance(text);
+        const selectedVoice =
+          voicesRef.current.find(
+            (voice) => voice.voiceURI === selectedVoiceURIRef.current
+          ) || findPreferredVoice(voicesRef.current);
+
+        if (selectedVoice) {
+          utterance.voice = selectedVoice;
+        }
+
+        utterance.lang = "en-US";
+        utterance.rate = 0.9;
+        utterance.pitch = 1.0;
+        utterance.volume = 1;
+
+        utterance.onend = () => {
+          finish();
+        };
+
+        utterance.onerror = () => {
+          finish();
+        };
+
+        window.speechSynthesis.speak(utterance);
+      };
+
+      try {
+        const audioBlob = await synthesizeSpeech(text);
+        if (settled) return;
+
+        const audioUrl = URL.createObjectURL(audioBlob);
+        const audio = new Audio(audioUrl);
+        ttsAudioRef.current = audio;
+        ttsAudioUrlRef.current = audioUrl;
+
+        audio.onended = () => {
+          if (ttsAudioUrlRef.current) {
+            URL.revokeObjectURL(ttsAudioUrlRef.current);
+            ttsAudioUrlRef.current = "";
+          }
+          ttsAudioRef.current = null;
+          finish();
+        };
+
+        audio.onerror = () => {
+          if (ttsAudioUrlRef.current) {
+            URL.revokeObjectURL(ttsAudioUrlRef.current);
+            ttsAudioUrlRef.current = "";
+          }
+          ttsAudioRef.current = null;
+          console.warn("ElevenLabs audio playback failed; using browser speech fallback.");
+          playBrowserSpeech();
+        };
+
+        await audio.play();
+        return;
+      } catch (err) {
+        if (settled) return;
+        console.warn("ElevenLabs TTS failed; using browser speech fallback.", err);
       }
 
-      utterance.lang = "en-US";
-      utterance.rate = 0.9;
-      utterance.pitch = 1.0;
-      utterance.volume = 1;
-
-      utterance.onend = () => {
-        finish();
-      };
-
-      utterance.onerror = () => {
-        finish();
-      };
-
-      window.speechSynthesis.speak(utterance);
+      playBrowserSpeech();
     });
   }
 
@@ -705,6 +890,7 @@ function AssistantApp() {
     clearTimeout(turnGraceTimerRef.current);
     clearTimeout(fallbackTurnTimerRef.current);
     pendingTranscriptRef.current = "";
+    completedAudioBlobsRef.current = [];
     speechActiveRef.current = false;
     setStatus("Thinking");
     stopListening();
@@ -801,8 +987,10 @@ function AssistantApp() {
       clearTimeout(turnGraceTimerRef.current);
       clearTimeout(fallbackTurnTimerRef.current);
       pendingTranscriptRef.current = "";
+      completedAudioBlobsRef.current = [];
       speechActiveRef.current = false;
       stopVad();
+      releaseRecorderStream();
       stopListening();
       window.speechSynthesis?.cancel();
       speakingRef.current = false;
@@ -840,8 +1028,10 @@ function AssistantApp() {
     clearTimeout(turnGraceTimerRef.current);
     clearTimeout(fallbackTurnTimerRef.current);
     pendingTranscriptRef.current = "";
+    completedAudioBlobsRef.current = [];
     speechActiveRef.current = false;
     window.speechSynthesis?.cancel();
+    releaseRecorderStream();
     stopListening();
     setSpeaking(false);
     setError("");

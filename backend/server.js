@@ -1,6 +1,7 @@
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
+import multer from "multer";
 import { GoogleGenAI } from "@google/genai";
 
 dotenv.config();
@@ -8,6 +9,12 @@ dotenv.config();
 const PORT = process.env.PORT || 3001;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
+const ELEVENLABS_STT_MODEL = process.env.ELEVENLABS_STT_MODEL || "scribe_v1";
+const ELEVENLABS_TTS_MODEL =
+  process.env.ELEVENLABS_TTS_MODEL || "eleven_flash_v2_5";
+const ELEVENLABS_VOICE_ID =
+  process.env.ELEVENLABS_VOICE_ID || "JBFqnCBsd6RMkjVDRZzb";
 const MEMORY_REVIEW_TIMEOUT_MS = Number(
   process.env.MEMORY_REVIEW_TIMEOUT_MS || 10000
 );
@@ -23,12 +30,111 @@ if (!GEMINI_API_KEY) {
 const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
 
 const app = express();
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 12 * 1024 * 1024 },
+});
+
 app.use(cors());
 app.use(express.json());
 
 // Simple health check
 app.get("/api/health", (req, res) => {
   res.json({ status: "ok", model: GEMINI_MODEL });
+});
+
+app.post("/api/stt", upload.single("audio"), async (req, res) => {
+  try {
+    if (!ELEVENLABS_API_KEY) {
+      return res.status(503).json({ error: "ElevenLabs STT is not configured." });
+    }
+
+    if (!req.file?.buffer?.length) {
+      return res.status(400).json({ error: "An audio file is required." });
+    }
+
+    const audioType = req.file.mimetype || "audio/webm";
+    const audioName = req.file.originalname || "speech.webm";
+    const formData = new FormData();
+    formData.append("model_id", ELEVENLABS_STT_MODEL);
+    formData.append(
+      "file",
+      new Blob([req.file.buffer], { type: audioType }),
+      audioName
+    );
+
+    const response = await fetch("https://api.elevenlabs.io/v1/speech-to-text", {
+      method: "POST",
+      headers: {
+        "xi-api-key": ELEVENLABS_API_KEY,
+      },
+      body: formData,
+    });
+
+    const data = await response.json().catch(() => ({}));
+
+    if (!response.ok) {
+      return res.status(response.status).json({
+        error: "ElevenLabs STT request failed.",
+        detail: data.detail || data.message || response.statusText,
+      });
+    }
+
+    res.json({ transcript: (data.text || "").trim(), raw: data });
+  } catch (err) {
+    console.error("[voice-buddy] /api/stt error:", err);
+    res.status(502).json({ error: "Failed to transcribe audio.", detail: err.message });
+  }
+});
+
+app.post("/api/tts", async (req, res) => {
+  try {
+    if (!ELEVENLABS_API_KEY) {
+      return res.status(503).json({ error: "ElevenLabs TTS is not configured." });
+    }
+
+    const { text } = req.body || {};
+
+    if (!text || typeof text !== "string" || !text.trim()) {
+      return res.status(400).json({ error: "A non-empty 'text' is required." });
+    }
+
+    const response = await fetch(
+      `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}`,
+      {
+        method: "POST",
+        headers: {
+          Accept: "audio/mpeg",
+          "Content-Type": "application/json",
+          "xi-api-key": ELEVENLABS_API_KEY,
+        },
+        body: JSON.stringify({
+          text: text.trim(),
+          model_id: ELEVENLABS_TTS_MODEL,
+          voice_settings: {
+            stability: 0.5,
+            similarity_boost: 0.75,
+          },
+        }),
+      }
+    );
+
+    if (!response.ok) {
+      const detail = await response.text().catch(() => response.statusText);
+      return res.status(response.status).json({
+        error: "ElevenLabs TTS request failed.",
+        detail,
+      });
+    }
+
+    const audio = Buffer.from(await response.arrayBuffer());
+    res.setHeader("Content-Type", response.headers.get("content-type") || "audio/mpeg");
+    res.setHeader("Cache-Control", "no-store");
+    res.send(audio);
+  } catch (err) {
+    console.error("[voice-buddy] /api/tts error:", err);
+    res.status(502).json({ error: "Failed to generate speech.", detail: err.message });
+  }
 });
 
 function decodeXml(value = "") {

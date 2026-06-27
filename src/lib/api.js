@@ -37,3 +37,41 @@ export async function reviewMessageForMemory(message, candidates = []) {
 
   return data;
 }
+
+export async function transcribeSpeech(audioBlob) {
+  const formData = new FormData();
+  const extension = audioBlob.type.includes("mp4")
+    ? "mp4"
+    : audioBlob.type.includes("mpeg")
+    ? "mp3"
+    : "webm";
+  formData.append("audio", audioBlob, `speech.${extension}`);
+
+  const res = await fetch(apiUrl("/api/stt"), {
+    method: "POST",
+    body: formData,
+  });
+
+  const data = await res.json().catch(() => ({}));
+
+  if (!res.ok) {
+    throw new Error(data.error || `STT request failed (${res.status})`);
+  }
+
+  return data.transcript || "";
+}
+
+export async function synthesizeSpeech(text) {
+  const res = await fetch(apiUrl("/api/tts"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text }),
+  });
+
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || `TTS request failed (${res.status})`);
+  }
+
+  return await res.blob();
+}
