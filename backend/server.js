@@ -21,6 +21,11 @@ const MEMORY_REVIEW_TIMEOUT_MS = Number(
 const GEMINI_QUOTA_MESSAGE =
   "I’m temporarily out of AI requests for now. Your reminders and saved information are still safe. Try again later.";
 
+const FRIENDLY_GEMINI_QUOTA_MESSAGE =
+  "My Gemini quota is exhausted for now. I can still help with reminders, weather, calculator, news, and saved information.";
+const ELEVENLABS_QUOTA_MESSAGE =
+  "My ElevenLabs voice credits are unavailable right now, so I will switch to browser voice.";
+
 if (!GEMINI_API_KEY) {
   console.error(
     "[voice-buddy] Missing GEMINI_API_KEY. Copy .env.example to .env and add your key."
@@ -38,15 +43,189 @@ const upload = multer({
 app.use(cors());
 app.use(express.json());
 
+function serviceErrorResponse(errorType, message, detail) {
+  return {
+    errorType,
+    message,
+    error: message,
+    ...(detail ? { detail } : {}),
+  };
+}
+
+function errorDetails(err, extra = []) {
+  return [
+    err?.message,
+    err?.code,
+    err?.name,
+    err?.response?.statusText,
+    err?.cause?.message,
+    ...extra,
+  ]
+    .filter(Boolean)
+    .map((item) => (typeof item === "string" ? item : JSON.stringify(item)))
+    .join(" ")
+    .toLowerCase();
+}
+
+function isElevenLabsQuotaError(status, detail = "") {
+  const text = errorDetails(null, [detail]);
+
+  return (
+    status === 401 ||
+    status === 402 ||
+    text.includes("invalid") ||
+    text.includes("unauthorized") ||
+    text.includes("payment_required") ||
+    text.includes("paid_plan_required") ||
+    text.includes("quota") ||
+    text.includes("credit") ||
+    text.includes("rate limit")
+  );
+}
+
+function summarizeService(ok, detail = "") {
+  return {
+    ok,
+    ...(detail ? { detail } : {}),
+  };
+}
+
+async function checkGeminiAvailability() {
+  if (!GEMINI_API_KEY) {
+    return summarizeService(false, "Gemini API key is not configured.");
+  }
+
+  try {
+    const response = await withTimeout(
+      ai.models.generateContent({
+        model: GEMINI_MODEL,
+        contents: [{ role: "user", parts: [{ text: "Reply with OK only." }] }],
+      }),
+      10000,
+      "Gemini status check"
+    );
+
+    return summarizeService(Boolean(response.text), "Gemini responded.");
+  } catch (err) {
+    return summarizeService(
+      false,
+      isGeminiQuotaError(err)
+        ? "Gemini quota or rate limit issue."
+        : "Gemini status check failed."
+    );
+  }
+}
+
+async function checkElevenLabsTtsAvailability() {
+  if (!ELEVENLABS_API_KEY) {
+    return summarizeService(false, "ElevenLabs API key is not configured.");
+  }
+
+  try {
+    const response = await fetch("https://api.elevenlabs.io/v1/user/subscription", {
+      headers: { "xi-api-key": ELEVENLABS_API_KEY },
+    });
+
+    if (!response.ok) {
+      const detail = await response.text().catch(() => response.statusText);
+      return summarizeService(
+        false,
+        isElevenLabsQuotaError(response.status, detail)
+          ? "ElevenLabs TTS quota, credits, plan, or key issue."
+          : "ElevenLabs TTS status check failed."
+      );
+    }
+
+    return summarizeService(true, "ElevenLabs account responded.");
+  } catch (err) {
+    return summarizeService(false, "ElevenLabs TTS status check failed.");
+  }
+}
+
+async function checkElevenLabsSttAvailability() {
+  if (!ELEVENLABS_API_KEY) {
+    return summarizeService(false, "ElevenLabs API key is not configured.");
+  }
+
+  try {
+    const response = await fetch("https://api.elevenlabs.io/v1/models", {
+      headers: { "xi-api-key": ELEVENLABS_API_KEY },
+    });
+
+    if (!response.ok) {
+      const detail = await response.text().catch(() => response.statusText);
+      return summarizeService(
+        false,
+        isElevenLabsQuotaError(response.status, detail)
+          ? "ElevenLabs STT quota, credits, plan, or key issue."
+          : "ElevenLabs STT status check failed."
+      );
+    }
+
+    return summarizeService(true, "ElevenLabs API responded.");
+  } catch (err) {
+    return summarizeService(false, "ElevenLabs STT status check failed.");
+  }
+}
+
 // Simple health check
 app.get("/api/health", (req, res) => {
-  res.json({ status: "ok", model: GEMINI_MODEL });
+  res.json({
+    status: "ok",
+    server: "ok",
+    geminiConfigured: Boolean(GEMINI_API_KEY),
+    elevenLabsConfigured: Boolean(ELEVENLABS_API_KEY),
+    model: GEMINI_MODEL,
+    timestamp: new Date().toISOString(),
+  });
+});
+
+app.get("/api/status", async (req, res) => {
+  const [gemini, elevenLabsTts, elevenLabsStt] = await Promise.all([
+    checkGeminiAvailability(),
+    checkElevenLabsTtsAvailability(),
+    checkElevenLabsSttAvailability(),
+  ]);
+
+  res.json({
+    status: "ok",
+    timestamp: new Date().toISOString(),
+    backend: {
+      ok: true,
+      platform: process.env.RAILWAY_SERVICE_NAME ? "railway" : "local",
+    },
+    gemini: {
+      configured: Boolean(GEMINI_API_KEY),
+      model: GEMINI_MODEL,
+      ...gemini,
+    },
+    elevenLabs: {
+      configured: Boolean(ELEVENLABS_API_KEY),
+      ttsModel: ELEVENLABS_TTS_MODEL,
+      sttModel: ELEVENLABS_STT_MODEL,
+      tts: elevenLabsTts,
+      stt: elevenLabsStt,
+    },
+    supabase: {
+      configured: Boolean(
+        process.env.SUPABASE_URL ||
+          process.env.VITE_SUPABASE_URL ||
+          process.env.SUPABASE_ANON_KEY ||
+          process.env.SUPABASE_SERVICE_ROLE_KEY
+      ),
+    },
+  });
 });
 
 app.post("/api/stt", upload.single("audio"), async (req, res) => {
   try {
     if (!ELEVENLABS_API_KEY) {
-      return res.status(503).json({ error: "ElevenLabs STT is not configured." });
+      return res.status(503).json(
+        serviceErrorResponse(
+          "elevenlabs_unconfigured",
+          "My ElevenLabs voice is not configured right now, so I will switch to browser voice."
+        )
+      );
     }
 
     if (!req.file?.buffer?.length) {
@@ -74,23 +253,37 @@ app.post("/api/stt", upload.single("audio"), async (req, res) => {
     const data = await response.json().catch(() => ({}));
 
     if (!response.ok) {
+      const detail = data.detail || data.message || response.statusText;
+      const errorType = isElevenLabsQuotaError(response.status, detail)
+        ? "elevenlabs_quota"
+        : "elevenlabs_error";
+      const message =
+        errorType === "elevenlabs_quota"
+          ? ELEVENLABS_QUOTA_MESSAGE
+          : "ElevenLabs STT request failed.";
       return res.status(response.status).json({
-        error: "ElevenLabs STT request failed.",
-        detail: data.detail || data.message || response.statusText,
+        ...serviceErrorResponse(errorType, message, detail),
       });
     }
 
     res.json({ transcript: (data.text || "").trim(), raw: data });
   } catch (err) {
     console.error("[voice-buddy] /api/stt error:", err);
-    res.status(502).json({ error: "Failed to transcribe audio.", detail: err.message });
+    res
+      .status(502)
+      .json(serviceErrorResponse("elevenlabs_error", "Failed to transcribe audio.", err.message));
   }
 });
 
 app.post("/api/tts", async (req, res) => {
   try {
     if (!ELEVENLABS_API_KEY) {
-      return res.status(503).json({ error: "ElevenLabs TTS is not configured." });
+      return res.status(503).json(
+        serviceErrorResponse(
+          "elevenlabs_unconfigured",
+          "My ElevenLabs voice is not configured right now, so I will switch to browser voice."
+        )
+      );
     }
 
     const { text } = req.body || {};
@@ -121,10 +314,16 @@ app.post("/api/tts", async (req, res) => {
 
     if (!response.ok) {
       const detail = await response.text().catch(() => response.statusText);
-      return res.status(response.status).json({
-        error: "ElevenLabs TTS request failed.",
-        detail,
-      });
+      const errorType = isElevenLabsQuotaError(response.status, detail)
+        ? "elevenlabs_quota"
+        : "elevenlabs_error";
+      const message =
+        errorType === "elevenlabs_quota"
+          ? ELEVENLABS_QUOTA_MESSAGE
+          : "ElevenLabs TTS request failed.";
+      return res
+        .status(response.status)
+        .json(serviceErrorResponse(errorType, message, detail));
     }
 
     const audio = Buffer.from(await response.arrayBuffer());
@@ -133,7 +332,9 @@ app.post("/api/tts", async (req, res) => {
     res.send(audio);
   } catch (err) {
     console.error("[voice-buddy] /api/tts error:", err);
-    res.status(502).json({ error: "Failed to generate speech.", detail: err.message });
+    res
+      .status(502)
+      .json(serviceErrorResponse("elevenlabs_error", "Failed to generate speech.", err.message));
   }
 });
 
@@ -295,6 +496,7 @@ function isGeminiQuotaError(err) {
     details.includes("429") ||
     details.includes("quota") ||
     details.includes("resource_exhausted") ||
+    details.includes("rate limit") ||
     details.includes("too many requests")
   );
 }
@@ -359,7 +561,12 @@ app.post("/api/memory-review", async (req, res) => {
     if (!GEMINI_API_KEY) {
       return res
         .status(500)
-        .json({ error: "Server is missing GEMINI_API_KEY." });
+        .json(
+          serviceErrorResponse(
+            "gemini_unconfigured",
+            "Gemini is not configured on the backend right now."
+          )
+        );
     }
 
     const { message, candidates = [] } = req.body || {};
@@ -459,7 +666,9 @@ app.post("/api/chat", async (req, res) => {
 
     if (isGeminiQuotaError(err)) {
       return res.json({
-        reply: GEMINI_QUOTA_MESSAGE,
+        reply: FRIENDLY_GEMINI_QUOTA_MESSAGE,
+        errorType: "gemini_quota",
+        message: FRIENDLY_GEMINI_QUOTA_MESSAGE,
         degraded: true,
         reason: "gemini-quota",
       });
@@ -476,7 +685,12 @@ app.post("/api/chat/stream", async (req, res) => {
     if (!GEMINI_API_KEY) {
       return res
         .status(500)
-        .json({ error: "Server is missing GEMINI_API_KEY." });
+        .json(
+          serviceErrorResponse(
+            "gemini_unconfigured",
+            "Gemini is not configured on the backend right now."
+          )
+        );
     }
 
     res.setHeader("Content-Type", "application/x-ndjson; charset=utf-8");
@@ -504,7 +718,9 @@ app.post("/api/chat/stream", async (req, res) => {
       res.write(
         `${JSON.stringify({
           type: "done",
-          reply: GEMINI_QUOTA_MESSAGE,
+          reply: FRIENDLY_GEMINI_QUOTA_MESSAGE,
+          errorType: "gemini_quota",
+          message: FRIENDLY_GEMINI_QUOTA_MESSAGE,
           degraded: true,
           reason: "gemini-quota",
         })}\n`

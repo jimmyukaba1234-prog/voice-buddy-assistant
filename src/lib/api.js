@@ -5,6 +5,25 @@ export function apiUrl(path) {
   return `${API_BASE_URL}${normalizedPath}`;
 }
 
+function apiError(data, fallbackMessage, status) {
+  const err = new Error(data.message || data.error || fallbackMessage);
+  err.status = status;
+  err.errorType = data.errorType || "";
+  err.data = data;
+  return err;
+}
+
+export async function fetchServiceStatus() {
+  const res = await fetch(apiUrl("/api/status"));
+  const data = await res.json().catch(() => ({}));
+
+  if (!res.ok) {
+    throw apiError(data, `Status request failed (${res.status})`, res.status);
+  }
+
+  return data;
+}
+
 // Sends the current message plus history to the backend and returns the reply text.
 export async function sendChatMessage(
   message,
@@ -26,7 +45,13 @@ export async function sendChatMessage(
   const data = await res.json().catch(() => ({}));
 
   if (!res.ok) {
-    throw new Error(data.error || `Request failed (${res.status})`);
+    throw apiError(data, `Request failed (${res.status})`, res.status);
+  }
+
+  if (data.errorType) {
+    const err = apiError(data, data.reply || data.message || "Chat service issue.", res.status);
+    err.reply = data.reply || data.message || "";
+    throw err;
   }
 
   return data.reply;
@@ -52,7 +77,7 @@ export async function streamChatMessage(
 
   if (!res.ok || !res.body) {
     const data = await res.json().catch(() => ({}));
-    throw new Error(data.error || `Stream request failed (${res.status})`);
+    throw apiError(data, `Stream request failed (${res.status})`, res.status);
   }
 
   const reader = res.body.getReader();
@@ -74,9 +99,14 @@ export async function streamChatMessage(
         reply += event.text || "";
         onChunk(event.text || "");
       } else if (event.type === "done") {
+        if (event.errorType) {
+          const err = apiError(event, event.reply || event.message || "Stream degraded.", res.status);
+          err.reply = event.reply || event.message || "";
+          throw err;
+        }
         return event.reply || reply;
       } else if (event.type === "error") {
-        throw new Error(event.error || "Stream failed.");
+        throw apiError(event, "Stream failed.", res.status);
       }
     }
 
@@ -119,7 +149,7 @@ export async function transcribeSpeech(audioBlob) {
   const data = await res.json().catch(() => ({}));
 
   if (!res.ok) {
-    throw new Error(data.error || `STT request failed (${res.status})`);
+    throw apiError(data, `STT request failed (${res.status})`, res.status);
   }
 
   return data.transcript || "";
@@ -134,7 +164,7 @@ export async function synthesizeSpeech(text) {
 
   if (!res.ok) {
     const data = await res.json().catch(() => ({}));
-    throw new Error(data.error || `TTS request failed (${res.status})`);
+    throw apiError(data, `TTS request failed (${res.status})`, res.status);
   }
 
   return await res.blob();

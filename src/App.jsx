@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { AuthForm } from "./auth/AuthForm.jsx";
 import { useAuth } from "./auth/AuthProvider.jsx";
 import {
+  fetchServiceStatus,
   sendChatMessage,
   streamChatMessage,
   synthesizeSpeech,
@@ -47,6 +48,8 @@ const FALLBACK_SILENCE_DELAY_MS = 2200;
 const SELF_INTERRUPT_GUARD_MS = 450;
 const BRIDGE_PHRASES = ["On it.", "One moment.", "Let me check."];
 const ASSISTANT_NAME = "Heney";
+const ELEVENLABS_FALLBACK_NOTICE =
+  "ElevenLabs voice is unavailable, switching to backup voice.";
 const PREFERRED_VOICE_HINTS = [
   "natural",
   "online",
@@ -117,6 +120,8 @@ function AssistantApp() {
   const [voices, setVoices] = useState([]);
   const [selectedVoiceURI, setSelectedVoiceURI] = useState("");
   const [status, setStatus] = useState("Idle");
+  const [serviceStatus, setServiceStatus] = useState(null);
+  const [serviceIssue, setServiceIssue] = useState("online");
   const [error, setError] = useState("");
   const [micPermission, setMicPermission] = useState("unknown");
   const [vadStatus, setVadStatus] = useState("not-loaded");
@@ -153,6 +158,7 @@ function AssistantApp() {
   const ttsAudioRejectRef = useRef(null);
   const speechAbortRef = useRef(0);
   const ttsStartedAtRef = useRef(0);
+  const elevenLabsWarningShownRef = useRef(false);
 
   const conversationRef = useRef(conversation);
   const messagesRef = useRef(messages);
@@ -165,6 +171,91 @@ function AssistantApp() {
   const voicesRef = useRef(voices);
   const selectedVoiceURIRef = useRef(selectedVoiceURI);
   const handleSendMessageRef = useRef(null);
+
+  function serviceIssueFromStatus(nextStatus) {
+    if (!nextStatus?.backend?.ok) return "backend";
+    if (nextStatus.gemini?.configured && nextStatus.gemini?.ok === false) {
+      return "gemini";
+    }
+    if (
+      nextStatus.elevenLabs?.configured &&
+      (nextStatus.elevenLabs?.tts?.ok === false ||
+        nextStatus.elevenLabs?.stt?.ok === false)
+    ) {
+      return "elevenlabs";
+    }
+    return "online";
+  }
+
+  function serviceIssueLabel(issue = serviceIssue) {
+    switch (issue) {
+      case "gemini":
+        return "Gemini quota issue";
+      case "elevenlabs":
+        return "ElevenLabs issue";
+      case "backend":
+        return "Backend issue";
+      case "supabase":
+        return "Supabase/auth issue";
+      default:
+        return "Online";
+    }
+  }
+
+  function isStatusPrompt(message) {
+    const normalized = message.toLowerCase().replace(/[?.!,]/g, "").trim();
+    return (
+      normalized === "heney status" ||
+      normalized === "are you working" ||
+      normalized === "check your systems"
+    );
+  }
+
+  function formatSystemStatus(nextStatus = serviceStatus, issue = serviceIssue) {
+    if (!nextStatus) {
+      return "I cannot reach my status monitor right now. Text chat and local skills may still work if the app is online.";
+    }
+
+    const lines = [
+      `Overall: ${serviceIssueLabel(issue)}.`,
+      `Backend: ${nextStatus.backend?.ok ? "online" : "issue"}.`,
+      `Gemini: ${
+        nextStatus.gemini?.configured
+          ? nextStatus.gemini?.ok
+            ? "available"
+            : "quota or availability issue"
+          : "not configured"
+      }.`,
+      `ElevenLabs: ${
+        nextStatus.elevenLabs?.configured
+          ? nextStatus.elevenLabs?.tts?.ok && nextStatus.elevenLabs?.stt?.ok
+            ? "available"
+            : "voice issue, backup browser voice will be used"
+          : "not configured"
+      }.`,
+      `Supabase/auth: ${
+        nextStatus.supabase?.configured === false ? "backend env not configured" : "configured"
+      }.`,
+    ];
+
+    return lines.join(" ");
+  }
+
+  async function refreshServiceStatus({ quiet = true } = {}) {
+    try {
+      const nextStatus = await fetchServiceStatus();
+      const nextIssue = serviceIssueFromStatus(nextStatus);
+      setServiceStatus(nextStatus);
+      setServiceIssue(nextIssue);
+      return { status: nextStatus, issue: nextIssue };
+    } catch (err) {
+      setServiceIssue("backend");
+      if (!quiet) {
+        setError("I cannot reach the backend status monitor right now.");
+      }
+      return { status: null, issue: "backend" };
+    }
+  }
 
   useEffect(() => {
     conversationRef.current = conversation;
@@ -191,6 +282,7 @@ function AssistantApp() {
         setStatus("Idle");
       } catch (err) {
         if (!active) return;
+        setServiceIssue("supabase");
         setError(err.message || "Could not load your conversation.");
       } finally {
         if (active) {
@@ -217,6 +309,24 @@ function AssistantApp() {
   useEffect(() => {
     conversationLoadingRef.current = conversationLoading;
   }, [conversationLoading]);
+
+  useEffect(() => {
+    let active = true;
+
+    async function pollStatus() {
+      if (active) {
+        await refreshServiceStatus({ quiet: true });
+      }
+    }
+
+    pollStatus();
+    const intervalId = window.setInterval(pollStatus, 60000);
+
+    return () => {
+      active = false;
+      window.clearInterval(intervalId);
+    };
+  }, []);
 
   useEffect(() => {
     speakRepliesRef.current = speakReplies;
@@ -557,6 +667,9 @@ function AssistantApp() {
         }
       } catch (err) {
         console.warn("ElevenLabs STT failed; using browser SpeechRecognition fallback.", err);
+        if (err.errorType?.startsWith("elevenlabs")) {
+          setServiceIssue("elevenlabs");
+        }
       }
     }
 
@@ -998,6 +1111,15 @@ function AssistantApp() {
         if (settled) return;
         if (speechRunId !== speechAbortRef.current) return;
         console.warn("ElevenLabs chunked TTS failed; using browser speech fallback.", err);
+        if (
+          !elevenLabsWarningShownRef.current &&
+          (err.errorType?.startsWith("elevenlabs") || err.message)
+        ) {
+          elevenLabsWarningShownRef.current = true;
+          setServiceIssue("elevenlabs");
+          setError(ELEVENLABS_FALLBACK_NOTICE);
+          text = `${ELEVENLABS_FALLBACK_NOTICE} ${text}`;
+        }
       }
 
       speakWithBrowser(text, finish);
@@ -1089,6 +1211,13 @@ function AssistantApp() {
       );
       setMessages((prev) => [...prev, userMessage]);
 
+      if (isStatusPrompt(cleanText)) {
+        const result = await refreshServiceStatus({ quiet: false });
+        const reply = formatSystemStatus(result.status, result.issue);
+        await saveAndSpeakAssistantReply(activeConversation, reply);
+        return;
+      }
+
       const skillReply = await getLocalSkillReply({
         userId: user.id,
         message: cleanText,
@@ -1136,12 +1265,31 @@ function AssistantApp() {
         } catch (streamError) {
           console.warn("Gemini stream failed; using /api/chat fallback.", streamError);
 
-          if (!reply.trim()) {
-            reply = await sendChatMessage(cleanText, history, memoryContext, {
-              voiceMode: true,
-            });
+          if (streamError.errorType === "gemini_quota") {
+            reply = streamError.reply || streamError.message;
+            setServiceIssue("gemini");
             await bridgePromise;
             await saveAndSpeakAssistantReply(activeConversation, reply);
+            return;
+          }
+
+          if (!reply.trim()) {
+            try {
+              reply = await sendChatMessage(cleanText, history, memoryContext, {
+                voiceMode: true,
+              });
+              await bridgePromise;
+              await saveAndSpeakAssistantReply(activeConversation, reply);
+            } catch (chatError) {
+              if (chatError.errorType === "gemini_quota") {
+                reply = chatError.reply || chatError.message;
+                setServiceIssue("gemini");
+                await bridgePromise;
+                await saveAndSpeakAssistantReply(activeConversation, reply);
+                return;
+              }
+              throw chatError;
+            }
           } else {
             await streamingSpeaker.finish();
             await saveAssistantReply(activeConversation, reply);
@@ -1152,12 +1300,33 @@ function AssistantApp() {
           reply = await streamChatMessage(cleanText, history, memoryContext);
         } catch (streamError) {
           console.warn("Gemini stream failed; using /api/chat fallback.", streamError);
-          reply = await sendChatMessage(cleanText, history, memoryContext);
+          if (streamError.errorType === "gemini_quota") {
+            reply = streamError.reply || streamError.message;
+            setServiceIssue("gemini");
+          } else {
+            try {
+              reply = await sendChatMessage(cleanText, history, memoryContext);
+            } catch (chatError) {
+              if (chatError.errorType === "gemini_quota") {
+                reply = chatError.reply || chatError.message;
+                setServiceIssue("gemini");
+              } else {
+                throw chatError;
+              }
+            }
+          }
         }
 
         await saveAndSpeakAssistantReply(activeConversation, reply);
       }
     } catch (err) {
+      if (err.errorType === "gemini_quota") {
+        setServiceIssue("gemini");
+      } else if (err.errorType?.startsWith("elevenlabs")) {
+        setServiceIssue("elevenlabs");
+      } else if (err.status >= 500 || err.name === "TypeError") {
+        setServiceIssue("backend");
+      }
       setError(err.message || "Something went wrong.");
       setStatus("Idle");
     } finally {
@@ -1293,6 +1462,14 @@ function AssistantApp() {
 
         <div className="app__controls">
           <span className="status">{status}</span>
+          <button
+            type="button"
+            className={`service-status service-status--${serviceIssue}`}
+            onClick={() => refreshServiceStatus({ quiet: false })}
+            title="Check Heney systems"
+          >
+            {serviceIssueLabel()}
+          </button>
 
           <label className="toggle">
             <input
