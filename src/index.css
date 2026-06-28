@@ -620,6 +620,7 @@ body {
   color: #fca5a5;
   border-radius: 12px;
   font-size: 14px;
+  white-space: pre-line;
 }
 
 /* Composer */

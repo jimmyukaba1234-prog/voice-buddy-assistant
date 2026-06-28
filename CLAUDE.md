@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A personal AI voice assistant ("Heney") — a React + Vite frontend talks to a small Express backend that proxies to Google Gemini. The browser handles speech-to-text (Web Speech API) and text-to-speech (`speechSynthesis`); the backend only does the LLM call. There is no database, auth, or persistence — chat history lives in React state and is sent with each request.
+A personal AI voice assistant ("Heney") — a React + Vite frontend talks to a small Express backend that proxies to Google Gemini. The browser handles speech-to-text capture, while speaking is ElevenLabs-only through the backend TTS endpoint. There is no database, auth, or persistence — chat history lives in React state and is sent with each request.
 
 ## Two packages, two terminals
 
@@ -43,8 +43,8 @@ There is **no test runner and no linter configured** — do not assume `npm test
 
 - **History format translation happens in `backend/server.js`.** The frontend stores messages as `{ role: "user" | "assistant", text }`. The backend maps these to Gemini's `contents` shape — `assistant` → `model`, `text` → `parts: [{ text }]` — and appends the new message. The assistant persona is set via `systemInstruction` in the `generateContent` call, not in the frontend.
 
-- **`src/App.jsx` is the entire UI and contains all the voice-control complexity.** The non-obvious part is the **ref-mirror pattern**: nearly every piece of state (`messages`, `assistantMode`, `loading`, `listening`, `speaking`, etc.) has a paired `...Ref`, kept in sync via `useEffect`. This exists because the `SpeechRecognition` and `speechSynthesis` event callbacks are created once (in mount-time `useEffect`s) and would otherwise close over stale state. **When adding state that any speech callback reads, add and maintain its ref too**, or the callback will see stale values.
+- **`src/App.jsx` is the entire UI and contains all the voice-control complexity.** The non-obvious part is the **ref-mirror pattern**: nearly every piece of state (`messages`, `assistantMode`, `loading`, `listening`, `speaking`, etc.) has a paired `...Ref`, kept in sync via `useEffect`. This exists because long-lived speech recognition and audio playback callbacks would otherwise close over stale state. **When adding state that any speech callback reads, add and maintain its ref too**, or the callback will see stale values.
 
 - **"Assistant Mode" is a hands-free state machine.** When on, the app continuously cycles listen → transcribe → send → speak → listen. The loop is driven by `scheduleListening()` (a debounced `setTimeout` in `restartTimerRef`) and gated on `!loading && !speaking` to avoid the mic capturing the assistant's own TTS output. `recognition` is configured non-continuous (`continuous = false`), so each turn is a fresh `start()`; the `onend` handler re-arms the cycle. The manual 🎤 button (`toggleListening`) is a separate, single-shot path and is disabled while Assistant Mode is on.
 
-- **Browser support matters.** Web Speech API + `speechSynthesis` work best in Chrome/Edge; mic requires `localhost` or HTTPS. `findPreferredVoice()` picks a voice by matching `PREFERRED_VOICE_HINTS` (female voices) against the async-loaded `voices` list (`voiceschanged` event).
+- **Browser support matters.** Web Speech API works best in Chrome/Edge; mic requires `localhost` or HTTPS. Do not add client-side TTS fallback paths; Heney speech output must remain ElevenLabs-only.

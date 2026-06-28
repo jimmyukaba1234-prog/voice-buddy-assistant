@@ -1,13 +1,13 @@
 # Heney Assistant
 
 A simple personal AI voice assistant. Type or speak to it, it asks **Google Gemini**,
-and reads the answer back to you using your browser's text-to-speech.
+and reads the answer back to you using ElevenLabs through the backend TTS endpoint.
 
 ## Features
 
 - 💬 Text chat with a ChatGPT-style interface
 - 🎤 Voice input from the browser microphone (Web Speech API)
-- 🔊 Spoken responses (browser text-to-speech)
+- 🔊 Spoken responses with ElevenLabs TTS only
 - 🧠 Conversation history sent to Gemini for context
 - ⚡ Loading indicator and clean, responsive UI
 
@@ -30,7 +30,7 @@ voice-buddy-assistant/
 ├── src/
 │   ├── lib/
 │   │   └── api.js        # frontend → backend fetch helper
-│   ├── App.jsx           # chat UI (mic, TTS, history)
+│   ├── App.jsx           # chat UI (mic, ElevenLabs TTS, history)
 │   └── main.jsx
 ├── index.html
 ├── package.json          # frontend

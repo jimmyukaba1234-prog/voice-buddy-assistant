@@ -48,6 +48,9 @@ const BRIDGE_PHRASES = ["On it.", "One moment.", "Let me check."];
 const ASSISTANT_NAME = "Heney";
 const ELEVENLABS_UNAVAILABLE_MESSAGE =
   "ElevenLabs voice service unavailable.";
+const GEMINI_QUOTA_TITLE = "Gemini Quota Exhausted";
+const GEMINI_QUOTA_MESSAGE =
+  "I can still use non-AI features until quota resets.";
 const ELEVENLABS_SAFE_REASONS = new Set([
   "quota exceeded",
   "paid plan required",
@@ -226,7 +229,16 @@ function AssistantApp() {
     setStatus(assistantModeRef.current ? "Listening" : "Idle");
     setServiceIssue("elevenlabs");
     setElevenLabsVoice({ online: false, reason });
-    setError(`${ELEVENLABS_UNAVAILABLE_MESSAGE} ${reason}.`);
+    setError(`ElevenLabs Offline\n\nReason:\n${reason}`);
+  }
+
+  async function handleGeminiQuota(activeConversation, quotaReply = "") {
+    setServiceIssue("gemini");
+    setError(`${GEMINI_QUOTA_TITLE}\n\n"${GEMINI_QUOTA_MESSAGE}"`);
+    await saveAssistantReply(
+      activeConversation,
+      quotaReply || `${GEMINI_QUOTA_TITLE}\n\n${GEMINI_QUOTA_MESSAGE}`
+    );
   }
 
   function isStatusPrompt(message) {
@@ -912,7 +924,6 @@ function AssistantApp() {
       URL.revokeObjectURL(ttsAudioUrlRef.current);
       ttsAudioUrlRef.current = "";
     }
-    window.speechSynthesis?.cancel();
     speakingResolveRef.current?.();
     speakingResolveRef.current = null;
   }
@@ -1075,7 +1086,6 @@ function AssistantApp() {
       setStatus("Speaking");
       ttsStartedAtRef.current = Date.now();
       stopListening();
-      window.speechSynthesis.cancel();
       speakingResolveRef.current = finish;
 
       try {
@@ -1243,9 +1253,8 @@ function AssistantApp() {
 
           if (streamError.errorType === "gemini_quota") {
             reply = streamError.reply || streamError.message;
-            setServiceIssue("gemini");
             await bridgePromise;
-            await saveAndSpeakAssistantReply(activeConversation, reply);
+            await handleGeminiQuota(activeConversation, reply);
             return;
           }
 
@@ -1259,9 +1268,8 @@ function AssistantApp() {
             } catch (chatError) {
               if (chatError.errorType === "gemini_quota") {
                 reply = chatError.reply || chatError.message;
-                setServiceIssue("gemini");
                 await bridgePromise;
-                await saveAndSpeakAssistantReply(activeConversation, reply);
+                await handleGeminiQuota(activeConversation, reply);
                 return;
               }
               throw chatError;
@@ -1278,14 +1286,16 @@ function AssistantApp() {
           console.warn("Gemini stream failed; using /api/chat fallback.", streamError);
           if (streamError.errorType === "gemini_quota") {
             reply = streamError.reply || streamError.message;
-            setServiceIssue("gemini");
+            await handleGeminiQuota(activeConversation, reply);
+            return;
           } else {
             try {
               reply = await sendChatMessage(cleanText, history, memoryContext);
             } catch (chatError) {
               if (chatError.errorType === "gemini_quota") {
                 reply = chatError.reply || chatError.message;
-                setServiceIssue("gemini");
+                await handleGeminiQuota(activeConversation, reply);
+                return;
               } else {
                 throw chatError;
               }
@@ -1298,6 +1308,7 @@ function AssistantApp() {
     } catch (err) {
       if (err.errorType === "gemini_quota") {
         setServiceIssue("gemini");
+        setError(`${GEMINI_QUOTA_TITLE}\n\n"${GEMINI_QUOTA_MESSAGE}"`);
       } else if (err.errorType?.startsWith("elevenlabs")) {
         setServiceIssue("elevenlabs");
       } else if (err.status >= 500 || err.name === "TypeError") {
@@ -1343,7 +1354,6 @@ function AssistantApp() {
       stopVad();
       releaseRecorderStream();
       stopListening();
-      window.speechSynthesis?.cancel();
       speakingRef.current = false;
       setSpeaking(false);
       setStatus("Idle");
@@ -1381,7 +1391,6 @@ function AssistantApp() {
     pendingTranscriptRef.current = "";
     completedAudioBlobsRef.current = [];
     speechActiveRef.current = false;
-    window.speechSynthesis?.cancel();
     releaseRecorderStream();
     stopListening();
     setSpeaking(false);
