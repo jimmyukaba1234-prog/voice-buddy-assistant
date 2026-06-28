@@ -89,12 +89,12 @@ export async function getDailyBriefReply(userId) {
   );
 
   if (!hasPersonalBriefData) {
-    return "Good morning Jimmy. I don’t have any saved plans for today yet.";
+    return "Good morning. I don’t have any saved plans for today yet.";
   }
 
   const newsSummary = await newsBrief();
   const sections = [
-    "Good morning Jimmy.",
+    "Good morning.",
     reminderSummary,
     planSummary,
     weatherSummary,

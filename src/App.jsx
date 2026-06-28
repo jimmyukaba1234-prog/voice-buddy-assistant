@@ -50,7 +50,8 @@ const ELEVENLABS_UNAVAILABLE_MESSAGE =
   "ElevenLabs voice service unavailable.";
 const GEMINI_QUOTA_TITLE = "Gemini Quota Exhausted";
 const GEMINI_QUOTA_MESSAGE =
-  "I can still use non-AI features until quota resets.";
+  "Local tools are still available.";
+const ASSISTANT_GREETING_DATE_KEY = "heney:lastAssistantGreetingDate";
 const ELEVENLABS_SAFE_REASONS = new Set([
   "quota exceeded",
   "paid plan required",
@@ -62,9 +63,9 @@ const ELEVENLABS_SAFE_REASONS = new Set([
 
 function getAssistantModeGreeting() {
   const hour = new Date().getHours();
-  return hour >= 5 && hour < 12
-    ? "Good morning Jimmy, Heney is here."
-    : "Hi Jimmy, Heney is here.";
+  if (hour >= 5 && hour < 12) return "Good morning.";
+  if (hour >= 12 && hour < 17) return "Good afternoon.";
+  return "Good evening.";
 }
 
 function AssistantApp() {
@@ -229,16 +230,42 @@ function AssistantApp() {
     setStatus(assistantModeRef.current ? "Listening" : "Idle");
     setServiceIssue("elevenlabs");
     setElevenLabsVoice({ online: false, reason });
-    setError(`ElevenLabs Offline\n\nReason:\n${reason}`);
+    const visibleReason =
+      reason === "quota exceeded" || reason === "paid plan required"
+        ? "quota or subscription issue"
+        : reason;
+    setError(`ElevenLabs voice unavailable — ${visibleReason}.`);
   }
 
   async function handleGeminiQuota(activeConversation, quotaReply = "") {
     setServiceIssue("gemini");
-    setError(`${GEMINI_QUOTA_TITLE}\n\n"${GEMINI_QUOTA_MESSAGE}"`);
+    setError("Gemini quota exhausted. Local tools are still available.");
     await saveAssistantReply(
       activeConversation,
       quotaReply || `${GEMINI_QUOTA_TITLE}\n\n${GEMINI_QUOTA_MESSAGE}`
     );
+  }
+
+  function localDateKey(date = new Date()) {
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, "0");
+    const day = String(date.getDate()).padStart(2, "0");
+    return `${year}-${month}-${day}`;
+  }
+
+  function shouldSpeakDailyGreeting() {
+    try {
+      const today = localDateKey();
+      if (window.localStorage.getItem(ASSISTANT_GREETING_DATE_KEY) === today) {
+        return false;
+      }
+
+      window.localStorage.setItem(ASSISTANT_GREETING_DATE_KEY, today);
+      return true;
+    } catch (err) {
+      console.warn("Could not read assistant greeting state.", err);
+      return false;
+    }
   }
 
   function isStatusPrompt(message) {
@@ -1308,7 +1335,7 @@ function AssistantApp() {
     } catch (err) {
       if (err.errorType === "gemini_quota") {
         setServiceIssue("gemini");
-        setError(`${GEMINI_QUOTA_TITLE}\n\n"${GEMINI_QUOTA_MESSAGE}"`);
+        setError("Gemini quota exhausted. Local tools are still available.");
       } else if (err.errorType?.startsWith("elevenlabs")) {
         setServiceIssue("elevenlabs");
       } else if (err.status >= 500 || err.name === "TypeError") {
@@ -1342,7 +1369,10 @@ function AssistantApp() {
       pendingTranscriptRef.current = "";
       speechActiveRef.current = false;
       await startVad();
-      await speak(getAssistantModeGreeting());
+      setStatus("Listening");
+      if (shouldSpeakDailyGreeting()) {
+        await speak(getAssistantModeGreeting());
+      }
       scheduleListening(100);
     } else {
       clearTimeout(restartTimerRef.current);
