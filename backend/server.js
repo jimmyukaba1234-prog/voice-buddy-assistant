@@ -23,8 +23,8 @@ const GEMINI_QUOTA_MESSAGE =
 
 const FRIENDLY_GEMINI_QUOTA_MESSAGE =
   "My Gemini quota is exhausted for now. I can still help with reminders, weather, calculator, news, and saved information.";
-const ELEVENLABS_QUOTA_MESSAGE =
-  "My ElevenLabs voice credits are unavailable right now, so I will switch to browser voice.";
+const ELEVENLABS_UNAVAILABLE_MESSAGE =
+  "ElevenLabs voice service unavailable.";
 
 if (!GEMINI_API_KEY) {
   console.error(
@@ -43,11 +43,12 @@ const upload = multer({
 app.use(cors());
 app.use(express.json());
 
-function serviceErrorResponse(errorType, message, detail) {
+function serviceErrorResponse(errorType, message, detail, safeReason = "") {
   return {
     errorType,
     message,
     error: message,
+    ...(safeReason ? { safeReason } : {}),
     ...(detail ? { detail } : {}),
   };
 }
@@ -81,6 +82,60 @@ function isElevenLabsQuotaError(status, detail = "") {
     text.includes("credit") ||
     text.includes("rate limit")
   );
+}
+
+function elevenLabsSafeReason(status, detail = "") {
+  const text = errorDetails(null, [detail]);
+
+  if (
+    status === 401 ||
+    status === 403 ||
+    text.includes("invalid api key") ||
+    text.includes("invalid_api_key") ||
+    text.includes("unauthorized") ||
+    text.includes("authentication")
+  ) {
+    return "invalid key";
+  }
+
+  if (
+    status === 404 ||
+    text.includes("voice_not_found") ||
+    text.includes("voice not found") ||
+    text.includes("voice id") ||
+    text.includes("voice_id")
+  ) {
+    return "voice unavailable";
+  }
+
+  if (
+    status === 429 ||
+    text.includes("rate limit") ||
+    text.includes("too many requests")
+  ) {
+    return "rate limit";
+  }
+
+  if (
+    status === 402 ||
+    text.includes("paid_plan_required") ||
+    text.includes("payment_required") ||
+    text.includes("subscription") ||
+    text.includes("expired")
+  ) {
+    return "paid plan required";
+  }
+
+  if (
+    text.includes("quota") ||
+    text.includes("credit") ||
+    text.includes("limit exceeded") ||
+    text.includes("insufficient")
+  ) {
+    return "quota exceeded";
+  }
+
+  return "network error";
 }
 
 function summarizeService(ok, detail = "") {
@@ -193,7 +248,9 @@ app.post("/api/stt", upload.single("audio"), async (req, res) => {
       return res.status(503).json(
         serviceErrorResponse(
           "elevenlabs_unconfigured",
-          "My ElevenLabs voice is not configured right now, so I will switch to browser voice."
+          "ElevenLabs voice service unavailable.",
+          "",
+          "invalid key"
         )
       );
     }
@@ -229,10 +286,15 @@ app.post("/api/stt", upload.single("audio"), async (req, res) => {
         : "elevenlabs_error";
       const message =
         errorType === "elevenlabs_quota"
-          ? ELEVENLABS_QUOTA_MESSAGE
+          ? ELEVENLABS_UNAVAILABLE_MESSAGE
           : "ElevenLabs STT request failed.";
       return res.status(response.status).json({
-        ...serviceErrorResponse(errorType, message, detail),
+        ...serviceErrorResponse(
+          errorType,
+          message,
+          detail,
+          elevenLabsSafeReason(response.status, detail)
+        ),
       });
     }
 
@@ -251,7 +313,9 @@ app.post("/api/tts", async (req, res) => {
       return res.status(503).json(
         serviceErrorResponse(
           "elevenlabs_unconfigured",
-          "My ElevenLabs voice is not configured right now, so I will switch to browser voice."
+          ELEVENLABS_UNAVAILABLE_MESSAGE,
+          "",
+          "invalid key"
         )
       );
     }
@@ -262,6 +326,7 @@ app.post("/api/tts", async (req, res) => {
       return res.status(400).json({ error: "A non-empty 'text' is required." });
     }
 
+    console.log("[TTS] ElevenLabs request started");
     const response = await fetch(
       `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}`,
       {
@@ -284,27 +349,37 @@ app.post("/api/tts", async (req, res) => {
 
     if (!response.ok) {
       const detail = await response.text().catch(() => response.statusText);
+      const safeReason = elevenLabsSafeReason(response.status, detail);
+      console.warn(`[TTS] ElevenLabs unavailable: ${safeReason}`);
+      if (safeReason === "quota exceeded") {
+        console.warn("[TTS] quota exceeded");
+      }
       const errorType = isElevenLabsQuotaError(response.status, detail)
         ? "elevenlabs_quota"
         : "elevenlabs_error";
-      const message =
-        errorType === "elevenlabs_quota"
-          ? ELEVENLABS_QUOTA_MESSAGE
-          : "ElevenLabs TTS request failed.";
       return res
         .status(response.status)
-        .json(serviceErrorResponse(errorType, message, detail));
+        .json(serviceErrorResponse(errorType, ELEVENLABS_UNAVAILABLE_MESSAGE, detail, safeReason));
     }
 
     const audio = Buffer.from(await response.arrayBuffer());
+    console.log("[TTS] ElevenLabs success");
     res.setHeader("Content-Type", response.headers.get("content-type") || "audio/mpeg");
     res.setHeader("Cache-Control", "no-store");
     res.send(audio);
   } catch (err) {
     console.error("[voice-buddy] /api/tts error:", err);
+    console.warn("[TTS] ElevenLabs unavailable: network error");
     res
       .status(502)
-      .json(serviceErrorResponse("elevenlabs_error", "Failed to generate speech.", err.message));
+      .json(
+        serviceErrorResponse(
+          "elevenlabs_error",
+          ELEVENLABS_UNAVAILABLE_MESSAGE,
+          err.message,
+          "network error"
+        )
+      );
   }
 });
 

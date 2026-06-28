@@ -9,6 +9,7 @@ function apiError(data, fallbackMessage, status) {
   const err = new Error(data.message || data.error || fallbackMessage);
   err.status = status;
   err.errorType = data.errorType || "";
+  err.safeReason = data.safeReason || "";
   err.data = data;
   return err;
 }

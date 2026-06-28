@@ -35,8 +35,6 @@ const speechSupportLabel =
     : window.webkitSpeechRecognition
     ? "webkitSpeechRecognition"
     : "Not supported";
-const ttsSupported =
-  typeof window !== "undefined" && "speechSynthesis" in window;
 const showVoiceDebug = import.meta.env.VITE_SHOW_VOICE_DEBUG === "true";
 
 const configuredTurnEndGraceMs = Number(import.meta.env.VITE_TURN_END_GRACE_MS);
@@ -48,55 +46,16 @@ const FALLBACK_SILENCE_DELAY_MS = 2200;
 const SELF_INTERRUPT_GUARD_MS = 450;
 const BRIDGE_PHRASES = ["On it.", "One moment.", "Let me check."];
 const ASSISTANT_NAME = "Heney";
-const ELEVENLABS_FALLBACK_NOTICE =
-  "ElevenLabs voice is unavailable, switching to backup voice.";
-const PREFERRED_VOICE_HINTS = [
-  "natural",
-  "online",
-  "jenny",
-  "aria",
-  "zira",
-  "sonia",
-  "google uk english female",
-  "microsoft",
-  "female",
-  "samantha",
-  "natasha",
-  "susan",
-  "victoria",
-  "karen",
-];
-const SOOTHING_VOICE_HINTS = ["female", "natural", "online", "neural"];
-
-function findPreferredVoice(voices) {
-  return (
-    voices
-      .map((voice) => {
-        const name = voice.name.toLowerCase();
-        const lang = (voice.lang || "").toLowerCase();
-        const priorityMatch = PREFERRED_VOICE_HINTS.findIndex((hint) =>
-          name.includes(hint)
-        );
-        const priorityScore =
-          priorityMatch >= 0 ? (PREFERRED_VOICE_HINTS.length - priorityMatch) * 10 : 0;
-        const soothingScore = SOOTHING_VOICE_HINTS.reduce(
-          (score, hint) => score + (name.includes(hint) ? 6 : 0),
-          0
-        );
-        const englishScore = lang.startsWith("en") ? 8 : 0;
-        const defaultScore = voice.default ? 2 : 0;
-
-        return {
-          voice,
-          score: priorityScore + soothingScore + englishScore + defaultScore,
-        };
-      })
-      .sort((a, b) => b.score - a.score)[0]?.voice ||
-    voices.find((voice) => voice.default) ||
-    voices[0] ||
-    null
-  );
-}
+const ELEVENLABS_UNAVAILABLE_MESSAGE =
+  "ElevenLabs voice service unavailable.";
+const ELEVENLABS_SAFE_REASONS = new Set([
+  "quota exceeded",
+  "paid plan required",
+  "invalid key",
+  "voice unavailable",
+  "rate limit",
+  "network error",
+]);
 
 function getAssistantModeGreeting() {
   const hour = new Date().getHours();
@@ -117,11 +76,13 @@ function AssistantApp() {
   const [speakReplies, setSpeakReplies] = useState(true);
   const [assistantMode, setAssistantMode] = useState(false);
   const [showTranscript, setShowTranscript] = useState(false);
-  const [voices, setVoices] = useState([]);
-  const [selectedVoiceURI, setSelectedVoiceURI] = useState("");
   const [status, setStatus] = useState("Idle");
   const [serviceStatus, setServiceStatus] = useState(null);
   const [serviceIssue, setServiceIssue] = useState("online");
+  const [elevenLabsVoice, setElevenLabsVoice] = useState({
+    online: true,
+    reason: "",
+  });
   const [error, setError] = useState("");
   const [micPermission, setMicPermission] = useState("unknown");
   const [vadStatus, setVadStatus] = useState("not-loaded");
@@ -158,7 +119,6 @@ function AssistantApp() {
   const ttsAudioRejectRef = useRef(null);
   const speechAbortRef = useRef(0);
   const ttsStartedAtRef = useRef(0);
-  const elevenLabsWarningShownRef = useRef(false);
 
   const conversationRef = useRef(conversation);
   const messagesRef = useRef(messages);
@@ -168,8 +128,6 @@ function AssistantApp() {
   const listeningRef = useRef(false);
   const speakingRef = useRef(false);
   const speakRepliesRef = useRef(speakReplies);
-  const voicesRef = useRef(voices);
-  const selectedVoiceURIRef = useRef(selectedVoiceURI);
   const handleSendMessageRef = useRef(null);
 
   function serviceIssueFromStatus(nextStatus) {
@@ -202,6 +160,75 @@ function AssistantApp() {
     }
   }
 
+  function normalizeElevenLabsReason(errOrReason) {
+    const raw =
+      typeof errOrReason === "string"
+        ? errOrReason
+        : errOrReason?.safeReason || errOrReason?.data?.safeReason || "";
+    const normalized = raw.toLowerCase().trim();
+
+    if (ELEVENLABS_SAFE_REASONS.has(normalized)) return normalized;
+    if (normalized.includes("quota") || normalized.includes("credit")) {
+      return "quota exceeded";
+    }
+    if (normalized.includes("paid") || normalized.includes("subscription")) {
+      return "paid plan required";
+    }
+    if (normalized.includes("invalid") || normalized.includes("key")) {
+      return "invalid key";
+    }
+    if (normalized.includes("voice")) {
+      return "voice unavailable";
+    }
+    if (normalized.includes("rate")) {
+      return "rate limit";
+    }
+    return "network error";
+  }
+
+  function titleCaseReason(reason) {
+    return reason.replace(/\b\w/g, (letter) => letter.toUpperCase());
+  }
+
+  function elevenLabsVoiceLabel() {
+    return elevenLabsVoice.online
+      ? "ElevenLabs Online"
+      : `ElevenLabs Offline — ${titleCaseReason(elevenLabsVoice.reason)}`;
+  }
+
+  function setElevenLabsOnline() {
+    setElevenLabsVoice({ online: true, reason: "" });
+  }
+
+  function markElevenLabsUnavailable(errOrReason) {
+    const reason = normalizeElevenLabsReason(errOrReason);
+    console.warn("[TTS] ElevenLabs unavailable", reason);
+    if (reason === "quota exceeded") {
+      console.warn("[TTS] quota exceeded");
+    }
+
+    speechAbortRef.current += 1;
+    ttsAudioRejectRef.current?.(new Error("Speech interrupted."));
+    ttsAudioRejectRef.current = null;
+    if (ttsAudioRef.current) {
+      ttsAudioRef.current.pause();
+      ttsAudioRef.current.src = "";
+      ttsAudioRef.current = null;
+    }
+    if (ttsAudioUrlRef.current) {
+      URL.revokeObjectURL(ttsAudioUrlRef.current);
+      ttsAudioUrlRef.current = "";
+    }
+    speakingResolveRef.current?.();
+    speakingResolveRef.current = null;
+    speakingRef.current = false;
+    setSpeaking(false);
+    setStatus(assistantModeRef.current ? "Listening" : "Idle");
+    setServiceIssue("elevenlabs");
+    setElevenLabsVoice({ online: false, reason });
+    setError(`${ELEVENLABS_UNAVAILABLE_MESSAGE} ${reason}.`);
+  }
+
   function isStatusPrompt(message) {
     const normalized = message.toLowerCase().replace(/[?.!,]/g, "").trim();
     return (
@@ -230,7 +257,7 @@ function AssistantApp() {
         nextStatus.elevenLabs?.configured
           ? nextStatus.elevenLabs?.tts?.ok && nextStatus.elevenLabs?.stt?.ok
             ? "available"
-            : "voice issue, backup browser voice will be used"
+            : "voice issue"
           : "not configured"
       }.`,
       `Supabase/auth: ${
@@ -247,6 +274,18 @@ function AssistantApp() {
       const nextIssue = serviceIssueFromStatus(nextStatus);
       setServiceStatus(nextStatus);
       setServiceIssue(nextIssue);
+      if (nextStatus.elevenLabs?.configured && nextStatus.elevenLabs?.tts?.ok) {
+        setElevenLabsVoice((current) =>
+          current.online ? { online: true, reason: "" } : current
+        );
+      } else if (nextStatus.elevenLabs?.configured === false) {
+        setElevenLabsVoice({ online: false, reason: "invalid key" });
+      } else if (nextStatus.elevenLabs?.tts?.ok === false) {
+        setElevenLabsVoice({
+          online: false,
+          reason: normalizeElevenLabsReason(nextStatus.elevenLabs?.tts?.safeReason),
+        });
+      }
       return { status: nextStatus, issue: nextIssue };
     } catch (err) {
       setServiceIssue("backend");
@@ -333,14 +372,6 @@ function AssistantApp() {
   }, [speakReplies]);
 
   useEffect(() => {
-    voicesRef.current = voices;
-  }, [voices]);
-
-  useEffect(() => {
-    selectedVoiceURIRef.current = selectedVoiceURI;
-  }, [selectedVoiceURI]);
-
-  useEffect(() => {
     if (!navigator.permissions?.query) {
       setMicPermission("unknown");
       return;
@@ -371,33 +402,6 @@ function AssistantApp() {
       if (permissionStatus) {
         permissionStatus.onchange = null;
       }
-    };
-  }, []);
-
-  useEffect(() => {
-    if (!ttsSupported) return;
-
-    function loadVoices() {
-      const availableVoices = window.speechSynthesis.getVoices();
-      setVoices(availableVoices);
-
-      setSelectedVoiceURI((currentVoiceURI) => {
-        if (
-          currentVoiceURI &&
-          availableVoices.some((voice) => voice.voiceURI === currentVoiceURI)
-        ) {
-          return currentVoiceURI;
-        }
-
-        return findPreferredVoice(availableVoices)?.voiceURI || "";
-      });
-    }
-
-    loadVoices();
-    window.speechSynthesis.addEventListener("voiceschanged", loadVoices);
-
-    return () => {
-      window.speechSynthesis.removeEventListener("voiceschanged", loadVoices);
     };
   }, []);
 
@@ -996,6 +1000,16 @@ function AssistantApp() {
         return;
       }
 
+      if (ttsAudioRef.current) {
+        ttsAudioRef.current.pause();
+        ttsAudioRef.current.src = "";
+        ttsAudioRef.current = null;
+      }
+      if (ttsAudioUrlRef.current) {
+        URL.revokeObjectURL(ttsAudioUrlRef.current);
+        ttsAudioUrlRef.current = "";
+      }
+
       const audioUrl = URL.createObjectURL(audioBlob);
       const audio = new Audio(audioUrl);
       ttsAudioRef.current = audio;
@@ -1017,6 +1031,7 @@ function AssistantApp() {
 
       audio.onended = () => {
         cleanup();
+        console.log("[TTS] playback finished");
         resolve();
       };
 
@@ -1030,38 +1045,6 @@ function AssistantApp() {
         reject(err);
       });
     });
-  }
-
-  function speakWithBrowser(text, finish) {
-    if (!ttsSupported) {
-      finish();
-      return;
-    }
-
-    const utterance = new SpeechSynthesisUtterance(text);
-    const selectedVoice =
-      voicesRef.current.find(
-        (voice) => voice.voiceURI === selectedVoiceURIRef.current
-      ) || findPreferredVoice(voicesRef.current);
-
-    if (selectedVoice) {
-      utterance.voice = selectedVoice;
-    }
-
-    utterance.lang = "en-US";
-    utterance.rate = 0.9;
-    utterance.pitch = 1.0;
-    utterance.volume = 1;
-
-    utterance.onend = () => {
-      finish();
-    };
-
-    utterance.onerror = () => {
-      finish();
-    };
-
-    window.speechSynthesis.speak(utterance);
   }
 
   function speak(text, options = {}) {
@@ -1100,7 +1083,10 @@ function AssistantApp() {
 
         for (const chunk of chunks) {
           if (settled || speechRunId !== speechAbortRef.current) return;
+          console.log("[TTS] ElevenLabs request started");
           const audioBlob = await synthesizeSpeech(chunk);
+          console.log("[TTS] ElevenLabs success");
+          setElevenLabsOnline();
           if (settled || speechRunId !== speechAbortRef.current) return;
           await playAudioBlob(audioBlob, speechRunId);
         }
@@ -1110,19 +1096,9 @@ function AssistantApp() {
       } catch (err) {
         if (settled) return;
         if (speechRunId !== speechAbortRef.current) return;
-        console.warn("ElevenLabs chunked TTS failed; using browser speech fallback.", err);
-        if (
-          !elevenLabsWarningShownRef.current &&
-          (err.errorType?.startsWith("elevenlabs") || err.message)
-        ) {
-          elevenLabsWarningShownRef.current = true;
-          setServiceIssue("elevenlabs");
-          setError(ELEVENLABS_FALLBACK_NOTICE);
-          text = `${ELEVENLABS_FALLBACK_NOTICE} ${text}`;
-        }
+        markElevenLabsUnavailable(err);
+        finish();
       }
-
-      speakWithBrowser(text, finish);
     });
   }
 
@@ -1464,6 +1440,18 @@ function AssistantApp() {
           <span className="status">{status}</span>
           <button
             type="button"
+            className={`voice-service-status ${
+              elevenLabsVoice.online
+                ? "voice-service-status--online"
+                : "voice-service-status--offline"
+            }`}
+            onClick={() => refreshServiceStatus({ quiet: false })}
+            title="Check ElevenLabs voice"
+          >
+            {elevenLabsVoiceLabel()}
+          </button>
+          <button
+            type="button"
             className={`service-status service-status--${serviceIssue}`}
             onClick={() => refreshServiceStatus({ quiet: false })}
             title="Check Heney systems"
@@ -1481,32 +1469,14 @@ function AssistantApp() {
             <span>Assistant Mode</span>
           </label>
 
-          {ttsSupported && (
-            <label className="toggle">
-              <input
-                type="checkbox"
-                checked={speakReplies}
-                onChange={(e) => setSpeakReplies(e.target.checked)}
-              />
-              <span>Speak replies</span>
-            </label>
-          )}
-
-          {ttsSupported && voices.length > 0 && (
-            <label className="select-field">
-              <span>Voice</span>
-              <select
-                value={selectedVoiceURI}
-                onChange={(e) => setSelectedVoiceURI(e.target.value)}
-              >
-                {voices.map((voice) => (
-                  <option key={voice.voiceURI} value={voice.voiceURI}>
-                    {voice.name}
-                  </option>
-                ))}
-              </select>
-            </label>
-          )}
+          <label className="toggle">
+            <input
+              type="checkbox"
+              checked={speakReplies}
+              onChange={(e) => setSpeakReplies(e.target.checked)}
+            />
+            <span>Speak replies</span>
+          </label>
 
           <label className="toggle">
             <input

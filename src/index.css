@@ -249,6 +249,29 @@ body {
   cursor: pointer;
 }
 
+.voice-service-status {
+  padding: 0.32rem 0.58rem;
+  border-radius: 999px;
+  font: inherit;
+  font-size: 0.74rem;
+  font-weight: 700;
+  line-height: 1.2;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.voice-service-status--online {
+  color: #061012;
+  background: var(--accent);
+  border: 1px solid rgba(36, 210, 195, 0.7);
+}
+
+.voice-service-status--offline {
+  color: #1b1405;
+  background: var(--gold);
+  border: 1px solid rgba(243, 184, 74, 0.72);
+}
+
 .service-status--gemini,
 .service-status--elevenlabs,
 .service-status--supabase {
