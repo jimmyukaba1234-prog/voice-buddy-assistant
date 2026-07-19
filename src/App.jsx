@@ -134,6 +134,18 @@ function AssistantApp() {
   const speakRepliesRef = useRef(speakReplies);
   const handleSendMessageRef = useRef(null);
 
+  // The backend now requires a valid Supabase session token on every route. A 401
+  // means that token is missing/invalid/expired — sign out and show the login form
+  // rather than leaving the user stuck on silently-failing requests.
+  function handleUnauthorized(err) {
+    if (err?.status !== 401) return false;
+
+    setError("Your session has expired. Please log in again.");
+    setStatus("Idle");
+    signOut();
+    return true;
+  }
+
   function serviceIssueFromStatus(nextStatus) {
     if (!nextStatus?.backend?.ok) return "backend";
     if (nextStatus.gemini?.configured && nextStatus.gemini?.ok === false) {
@@ -327,6 +339,9 @@ function AssistantApp() {
       }
       return { status: nextStatus, issue: nextIssue };
     } catch (err) {
+      if (handleUnauthorized(err)) {
+        return { status: null, issue: "backend" };
+      }
       setServiceIssue("backend");
       if (!quiet) {
         setError("I cannot reach the backend status monitor right now.");
@@ -710,6 +725,7 @@ function AssistantApp() {
         }
       } catch (err) {
         console.warn("ElevenLabs STT failed; using browser SpeechRecognition fallback.", err);
+        handleUnauthorized(err);
         if (err.errorType?.startsWith("elevenlabs")) {
           setServiceIssue("elevenlabs");
         }
@@ -1133,6 +1149,10 @@ function AssistantApp() {
       } catch (err) {
         if (settled) return;
         if (speechRunId !== speechAbortRef.current) return;
+        if (handleUnauthorized(err)) {
+          finish();
+          return;
+        }
         markElevenLabsUnavailable(err);
         finish();
       }
@@ -1333,6 +1353,9 @@ function AssistantApp() {
         await saveAndSpeakAssistantReply(activeConversation, reply);
       }
     } catch (err) {
+      if (handleUnauthorized(err)) {
+        return;
+      }
       if (err.errorType === "gemini_quota") {
         setServiceIssue("gemini");
         setError("Gemini quota exhausted. Local tools are still available.");

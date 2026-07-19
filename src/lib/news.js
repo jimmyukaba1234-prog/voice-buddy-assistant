@@ -1,4 +1,4 @@
-import { apiUrl } from "./api.js";
+import { apiUrl, authHeaders } from "./api.js";
 
 const NEWS_PATTERNS = [
   /\bwhat'?s happening today\b/i,
@@ -25,7 +25,9 @@ export function isNewsPrompt(message) {
 
 export async function getNewsReply(message) {
   const topic = extractNewsTopic(message);
-  const response = await fetch(apiUrl(`/api/news?topic=${encodeURIComponent(topic)}`));
+  const response = await fetch(apiUrl(`/api/news?topic=${encodeURIComponent(topic)}`), {
+    headers: await authHeaders(),
+  });
 
   if (!response.ok) {
     throw new Error(`News request failed (${response.status})`);

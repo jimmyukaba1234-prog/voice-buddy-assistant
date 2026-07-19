@@ -2,7 +2,9 @@ import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import multer from "multer";
+import rateLimit, { ipKeyGenerator } from "express-rate-limit";
 import { GoogleGenAI } from "@google/genai";
+import { createClient } from "@supabase/supabase-js";
 
 dotenv.config();
 
@@ -18,6 +20,21 @@ const ELEVENLABS_VOICE_ID =
 const MEMORY_REVIEW_TIMEOUT_MS = Number(
   process.env.MEMORY_REVIEW_TIMEOUT_MS || 10000
 );
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+// Allowed browser origins. No-Origin requests (curl, server-to-server) are not
+// browser requests, so CORS does not apply to them; auth + rate limiting still guard them.
+const DEV_ORIGIN = "http://localhost:5173";
+const PRODUCTION_ORIGIN = "https://voice-buddy-assistant.vercel.app";
+const VERCEL_PREVIEW_ORIGIN_PATTERN =
+  /^https:\/\/voice-buddy-assistant-[a-z0-9-]+\.vercel\.app$/i;
+
+// Per-user (fallback per-IP) request limits on expensive, paid-API-backed routes.
+const CHAT_RATE_LIMIT_PER_MIN = 30;
+const TTS_RATE_LIMIT_PER_MIN = 60;
+const STT_RATE_LIMIT_PER_MIN = 30;
+
 const GEMINI_QUOTA_MESSAGE =
   "I’m temporarily out of AI requests for now. Your reminders and saved information are still safe. Try again later.";
 
@@ -34,13 +51,126 @@ if (!GEMINI_API_KEY) {
 
 const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
 
+if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+  console.error(
+    "[voice-buddy] Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY. " +
+      "Every authenticated route will reject requests until these are set."
+  );
+}
+
+const supabaseAdmin =
+  SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY
+    ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+        auth: { autoRefreshToken: false, persistSession: false },
+      })
+    : null;
+
+// Verifies the Supabase session JWT sent by the frontend and attaches the user
+// to the request. Every route below except /api/health requires this.
+async function requireAuth(req, res, next) {
+  const header = req.headers.authorization || "";
+  const token = header.startsWith("Bearer ") ? header.slice(7).trim() : "";
+
+  if (!token) {
+    return res.status(401).json({ error: "unauthorized" });
+  }
+
+  if (!supabaseAdmin) {
+    console.error(
+      "[voice-buddy] Cannot verify auth token: Supabase admin client is not configured."
+    );
+    return res.status(500).json({ error: "auth_not_configured" });
+  }
+
+  try {
+    const { data, error } = await supabaseAdmin.auth.getUser(token);
+
+    if (error || !data?.user) {
+      return res.status(401).json({ error: "unauthorized" });
+    }
+
+    req.user = { id: data.user.id, email: data.user.email };
+    next();
+  } catch (err) {
+    console.error("[voice-buddy] Auth verification error:", err);
+    res.status(401).json({ error: "unauthorized" });
+  }
+}
+
+function rateLimitKey(req) {
+  return req.user?.id || ipKeyGenerator(req.ip);
+}
+
+function createUserRateLimiter(max) {
+  return rateLimit({
+    windowMs: 60 * 1000,
+    max,
+    standardHeaders: true,
+    legacyHeaders: false,
+    keyGenerator: rateLimitKey,
+    handler: (req, res) => {
+      res.status(429).json({ error: "rate_limited" });
+    },
+  });
+}
+
+const chatRateLimiter = createUserRateLimiter(CHAT_RATE_LIMIT_PER_MIN);
+const ttsRateLimiter = createUserRateLimiter(TTS_RATE_LIMIT_PER_MIN);
+const sttRateLimiter = createUserRateLimiter(STT_RATE_LIMIT_PER_MIN);
+
+function summarizeForLog(value, max = 200) {
+  if (!value) return "";
+  const text = typeof value === "string" ? value : JSON.stringify(value);
+  const trimmed = text.replace(/\s+/g, " ").trim();
+  return trimmed.length > max ? `${trimmed.slice(0, max - 1)}…` : trimmed;
+}
+
+// Fire-and-forget audit log into public.tool_runs. Never throws — a logging
+// failure must never break the user-facing request that triggered it.
+async function logToolRun({ userId, toolName, input, status, output, error }) {
+  if (!supabaseAdmin || !userId || !toolName) return;
+
+  try {
+    const { error: insertError } = await supabaseAdmin.from("tool_runs").insert({
+      user_id: userId,
+      tool_name: toolName,
+      status: status === "failed" ? "failed" : "succeeded",
+      input: { summary: summarizeForLog(input) },
+      output: output ? { summary: summarizeForLog(output) } : null,
+      error: error ? summarizeForLog(error, 500) : null,
+      completed_at: new Date().toISOString(),
+    });
+
+    if (insertError) {
+      console.warn("[voice-buddy] tool_runs insert failed:", insertError.message);
+    }
+  } catch (logError) {
+    console.warn("[voice-buddy] tool_runs insert threw:", logError.message);
+  }
+}
+
 const app = express();
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 12 * 1024 * 1024 },
 });
 
-app.use(cors());
+app.use(
+  cors({
+    origin(origin, callback) {
+      if (
+        !origin ||
+        origin === DEV_ORIGIN ||
+        origin === PRODUCTION_ORIGIN ||
+        VERCEL_PREVIEW_ORIGIN_PATTERN.test(origin)
+      ) {
+        return callback(null, true);
+      }
+      callback(new Error("Not allowed by CORS"));
+    },
+    allowedHeaders: ["Authorization", "Content-Type"],
+  })
+);
 app.use(express.json());
 
 function serviceErrorResponse(errorType, message, detail, safeReason = "") {
@@ -193,19 +323,13 @@ async function checkElevenLabsSttAvailability() {
   );
 }
 
-// Simple health check
+// Unauthenticated uptime check only. No config/service details — those live behind
+// /api/status, which requires auth.
 app.get("/api/health", (req, res) => {
-  res.json({
-    status: "ok",
-    server: "ok",
-    geminiConfigured: Boolean(GEMINI_API_KEY),
-    elevenLabsConfigured: Boolean(ELEVENLABS_API_KEY),
-    model: GEMINI_MODEL,
-    timestamp: new Date().toISOString(),
-  });
+  res.json({ ok: true });
 });
 
-app.get("/api/status", async (req, res) => {
+app.get("/api/status", requireAuth, async (req, res) => {
   const [gemini, elevenLabsTts, elevenLabsStt] = await Promise.all([
     checkGeminiAvailability(),
     checkElevenLabsTtsAvailability(),
@@ -242,7 +366,7 @@ app.get("/api/status", async (req, res) => {
   });
 });
 
-app.post("/api/stt", upload.single("audio"), async (req, res) => {
+app.post("/api/stt", requireAuth, sttRateLimiter, upload.single("audio"), async (req, res) => {
   try {
     if (!ELEVENLABS_API_KEY) {
       return res.status(503).json(
@@ -288,6 +412,13 @@ app.post("/api/stt", upload.single("audio"), async (req, res) => {
         errorType === "elevenlabs_quota"
           ? ELEVENLABS_UNAVAILABLE_MESSAGE
           : "ElevenLabs STT request failed.";
+      logToolRun({
+        userId: req.user.id,
+        toolName: "stt",
+        input: `[audio upload, ${req.file.buffer.length} bytes]`,
+        status: "failed",
+        error: detail,
+      });
       return res.status(response.status).json({
         ...serviceErrorResponse(
           errorType,
@@ -298,16 +429,31 @@ app.post("/api/stt", upload.single("audio"), async (req, res) => {
       });
     }
 
-    res.json({ transcript: (data.text || "").trim(), raw: data });
+    const transcript = (data.text || "").trim();
+    logToolRun({
+      userId: req.user.id,
+      toolName: "stt",
+      input: `[audio upload, ${req.file.buffer.length} bytes]`,
+      status: "succeeded",
+      output: transcript,
+    });
+    res.json({ transcript, raw: data });
   } catch (err) {
     console.error("[voice-buddy] /api/stt error:", err);
+    logToolRun({
+      userId: req.user?.id,
+      toolName: "stt",
+      input: "[audio upload]",
+      status: "failed",
+      error: err.message,
+    });
     res
       .status(502)
       .json(serviceErrorResponse("elevenlabs_error", "Failed to transcribe audio.", err.message));
   }
 });
 
-app.post("/api/tts", async (req, res) => {
+app.post("/api/tts", requireAuth, ttsRateLimiter, async (req, res) => {
   try {
     if (!ELEVENLABS_API_KEY) {
       return res.status(503).json(
@@ -357,6 +503,13 @@ app.post("/api/tts", async (req, res) => {
       const errorType = isElevenLabsQuotaError(response.status, detail)
         ? "elevenlabs_quota"
         : "elevenlabs_error";
+      logToolRun({
+        userId: req.user.id,
+        toolName: "tts",
+        input: text,
+        status: "failed",
+        error: detail,
+      });
       return res
         .status(response.status)
         .json(serviceErrorResponse(errorType, ELEVENLABS_UNAVAILABLE_MESSAGE, detail, safeReason));
@@ -364,12 +517,25 @@ app.post("/api/tts", async (req, res) => {
 
     const audio = Buffer.from(await response.arrayBuffer());
     console.log("[TTS] ElevenLabs success");
+    logToolRun({
+      userId: req.user.id,
+      toolName: "tts",
+      input: text,
+      status: "succeeded",
+    });
     res.setHeader("Content-Type", response.headers.get("content-type") || "audio/mpeg");
     res.setHeader("Cache-Control", "no-store");
     res.send(audio);
   } catch (err) {
     console.error("[voice-buddy] /api/tts error:", err);
     console.warn("[TTS] ElevenLabs unavailable: network error");
+    logToolRun({
+      userId: req.user?.id,
+      toolName: "tts",
+      input: req.body?.text,
+      status: "failed",
+      error: err.message,
+    });
     res
       .status(502)
       .json(
@@ -410,7 +576,7 @@ function newsQueryForTopic(topic = "") {
   return "top news today";
 }
 
-app.get("/api/news", async (req, res) => {
+app.get("/api/news", requireAuth, async (req, res) => {
   try {
     const topic = typeof req.query.topic === "string" ? req.query.topic : "";
     const query = newsQueryForTopic(topic);
@@ -601,7 +767,7 @@ function buildChatRequest(body = {}) {
  * Body: { message: string, candidates?: [{ key, value, confidence, metadata }] }
  * Returns: { shouldRemember: boolean, memories: [...] }
  */
-app.post("/api/memory-review", async (req, res) => {
+app.post("/api/memory-review", requireAuth, async (req, res) => {
   try {
     if (!GEMINI_API_KEY) {
       return res
@@ -667,9 +833,23 @@ app.post("/api/memory-review", async (req, res) => {
     );
 
     const review = normalizeMemoryReview(parseStrictJson(response.text));
+    logToolRun({
+      userId: req.user.id,
+      toolName: "memory-review",
+      input: message,
+      status: "succeeded",
+      output: review.shouldRemember ? `${review.memories.length} memory(ies)` : "no memory",
+    });
     res.json(review);
   } catch (err) {
     console.error("[voice-buddy] /api/memory-review error:", err);
+    logToolRun({
+      userId: req.user?.id,
+      toolName: "memory-review",
+      input: req.body?.message,
+      status: "failed",
+      error: err.message,
+    });
     res.status(502).json({
       error: "Failed to review memory with Gemini.",
       detail: err.message,
@@ -687,7 +867,7 @@ app.post("/api/memory-review", async (req, res) => {
  * }
  * Returns: { reply: string }
  */
-app.post("/api/chat", async (req, res) => {
+app.post("/api/chat", requireAuth, chatRateLimiter, async (req, res) => {
   try {
     if (!GEMINI_API_KEY) {
       return res
@@ -700,16 +880,37 @@ app.post("/api/chat", async (req, res) => {
     const reply = response.text?.trim();
 
     if (!reply) {
+      logToolRun({
+        userId: req.user.id,
+        toolName: "chat",
+        input: req.body?.message,
+        status: "failed",
+        error: "empty response",
+      });
       return res
         .status(502)
         .json({ error: "Gemini returned an empty response." });
     }
 
+    logToolRun({
+      userId: req.user.id,
+      toolName: "chat",
+      input: req.body?.message,
+      status: "succeeded",
+      output: reply,
+    });
     res.json({ reply });
   } catch (err) {
     console.error("[voice-buddy] /api/chat error:", err);
 
     if (isGeminiQuotaError(err)) {
+      logToolRun({
+        userId: req.user?.id,
+        toolName: "chat",
+        input: req.body?.message,
+        status: "failed",
+        error: "gemini quota",
+      });
       return res.json({
         reply: FRIENDLY_GEMINI_QUOTA_MESSAGE,
         errorType: "gemini_quota",
@@ -719,13 +920,20 @@ app.post("/api/chat", async (req, res) => {
       });
     }
 
+    logToolRun({
+      userId: req.user?.id,
+      toolName: "chat",
+      input: req.body?.message,
+      status: "failed",
+      error: err.message,
+    });
     res
       .status(err.status || 500)
       .json({ error: "Failed to get a response from Gemini.", detail: err.message });
   }
 });
 
-app.post("/api/chat/stream", async (req, res) => {
+app.post("/api/chat/stream", requireAuth, chatRateLimiter, async (req, res) => {
   try {
     if (!GEMINI_API_KEY) {
       return res
@@ -754,12 +962,26 @@ app.post("/api/chat/stream", async (req, res) => {
       res.write(`${JSON.stringify({ type: "chunk", text })}\n`);
     }
 
+    logToolRun({
+      userId: req.user.id,
+      toolName: "chat-stream",
+      input: req.body?.message,
+      status: "succeeded",
+      output: fullText.trim(),
+    });
     res.write(`${JSON.stringify({ type: "done", reply: fullText.trim() })}\n`);
     res.end();
   } catch (err) {
     console.error("[voice-buddy] /api/chat/stream error:", err);
 
     if (isGeminiQuotaError(err)) {
+      logToolRun({
+        userId: req.user?.id,
+        toolName: "chat-stream",
+        input: req.body?.message,
+        status: "failed",
+        error: "gemini quota",
+      });
       res.write(
         `${JSON.stringify({
           type: "done",
@@ -772,6 +994,14 @@ app.post("/api/chat/stream", async (req, res) => {
       );
       return res.end();
     }
+
+    logToolRun({
+      userId: req.user?.id,
+      toolName: "chat-stream",
+      input: req.body?.message,
+      status: "failed",
+      error: err.message,
+    });
 
     if (!res.headersSent) {
       return res
@@ -788,6 +1018,33 @@ app.post("/api/chat/stream", async (req, res) => {
     );
     res.end();
   }
+});
+
+/**
+ * POST /api/tool-run
+ * Body: { toolName: string, input?: string, status?: "succeeded"|"failed", output?: string, error?: string }
+ * Lets the frontend log local skill invocations (calculator, weather, reminders, etc.)
+ * into tool_runs — those never otherwise touch the backend, so this is the only way
+ * to audit-log them through the admin client.
+ */
+app.post("/api/tool-run", requireAuth, async (req, res) => {
+  const { toolName, input, status, output, error } = req.body || {};
+
+  if (!toolName || typeof toolName !== "string") {
+    return res.status(400).json({ error: "A 'toolName' is required." });
+  }
+
+  await logToolRun({ userId: req.user.id, toolName, input, status, output, error });
+  res.json({ ok: true });
+});
+
+// Must be mounted after every route: express only invokes 4-arg middleware via next(err),
+// which is how the cors() origin check above reports a rejected origin.
+app.use((err, req, res, next) => {
+  if (err && err.message === "Not allowed by CORS") {
+    return res.status(403).json({ error: "cors_rejected" });
+  }
+  next(err);
 });
 
 app.listen(PORT, () => {

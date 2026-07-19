@@ -1,8 +1,20 @@
+import { supabase } from "./supabase.js";
+
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || "").replace(/\/+$/g, "");
 
 export function apiUrl(path) {
   const normalizedPath = path.startsWith("/") ? path : `/${path}`;
   return `${API_BASE_URL}${normalizedPath}`;
+}
+
+// Every backend route (except /api/health) requires the current Supabase session
+// token. Callers merge this into their fetch headers.
+export async function authHeaders() {
+  if (!supabase) return {};
+
+  const { data } = await supabase.auth.getSession();
+  const token = data?.session?.access_token;
+  return token ? { Authorization: `Bearer ${token}` } : {};
 }
 
 function apiError(data, fallbackMessage, status) {
@@ -15,7 +27,9 @@ function apiError(data, fallbackMessage, status) {
 }
 
 export async function fetchServiceStatus() {
-  const res = await fetch(apiUrl("/api/status"));
+  const res = await fetch(apiUrl("/api/status"), {
+    headers: await authHeaders(),
+  });
   const data = await res.json().catch(() => ({}));
 
   if (!res.ok) {
@@ -34,7 +48,7 @@ export async function sendChatMessage(
 ) {
   const res = await fetch(apiUrl("/api/chat"), {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...(await authHeaders()) },
     body: JSON.stringify({
       message,
       history,
@@ -67,7 +81,7 @@ export async function streamChatMessage(
 ) {
   const res = await fetch(apiUrl("/api/chat/stream"), {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...(await authHeaders()) },
     body: JSON.stringify({
       message,
       history,
@@ -120,7 +134,7 @@ export async function streamChatMessage(
 export async function reviewMessageForMemory(message, candidates = []) {
   const res = await fetch(apiUrl("/api/memory-review"), {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...(await authHeaders()) },
     body: JSON.stringify({ message, candidates }),
   });
 
@@ -144,6 +158,7 @@ export async function transcribeSpeech(audioBlob) {
 
   const res = await fetch(apiUrl("/api/stt"), {
     method: "POST",
+    headers: await authHeaders(),
     body: formData,
   });
 
@@ -159,7 +174,7 @@ export async function transcribeSpeech(audioBlob) {
 export async function synthesizeSpeech(text) {
   const res = await fetch(apiUrl("/api/tts"), {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...(await authHeaders()) },
     body: JSON.stringify({ text }),
   });
 

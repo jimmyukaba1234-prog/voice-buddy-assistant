@@ -17,6 +17,7 @@ import {
   getWeatherReply,
   isWeatherPrompt,
 } from "./weather.js";
+import { logToolRun } from "./toolRunLog.js";
 
 async function weatherReply(userId, message) {
   const weatherRequest = extractWeatherLocation(message);
@@ -36,43 +37,60 @@ async function weatherReply(userId, message) {
 export async function getLocalSkillReply({ userId, message, currentMessageId }) {
   if (isCalculatorPrompt(message)) {
     try {
-      return getCalculatorReply(message);
+      const reply = getCalculatorReply(message);
+      logToolRun("calculator", message, "succeeded");
+      return reply;
     } catch {
+      logToolRun("calculator", message, "failed");
       return "";
     }
   }
 
   if (isDailyBriefPrompt(message)) {
-    return getDailyBriefReply(userId);
+    const reply = await getDailyBriefReply(userId);
+    logToolRun("daily-brief", message, "succeeded");
+    return reply;
   }
 
   if (isReminderPrompt(message)) {
-    return handleReminderPrompt(userId, message);
+    const reply = await handleReminderPrompt(userId, message);
+    logToolRun("reminders", message, "succeeded");
+    return reply;
   }
 
   if (isWeatherPrompt(message)) {
     try {
-      return await weatherReply(userId, message);
+      const reply = await weatherReply(userId, message);
+      logToolRun("weather", message, "succeeded");
+      return reply;
     } catch {
+      logToolRun("weather", message, "failed");
       return "I could not reach the weather service right now. Try again in a moment.";
     }
   }
 
   if (isNewsPrompt(message)) {
     try {
-      return await getNewsReply(message);
+      const reply = await getNewsReply(message);
+      logToolRun("news", message, "succeeded");
+      return reply;
     } catch {
+      logToolRun("news", message, "failed");
       return "I could not reach the news source right now. Try again in a moment.";
     }
   }
 
   if (isConversationRecallPrompt(message)) {
-    return getConversationRecallReply(userId, message, currentMessageId);
+    const reply = await getConversationRecallReply(userId, message, currentMessageId);
+    logToolRun("conversation-recall", message, "succeeded");
+    return reply;
   }
 
   if (isMemoryRecallPrompt(message)) {
     const memories = await getMemories(userId);
-    return formatMemoryRecallReply(memories);
+    const reply = formatMemoryRecallReply(memories);
+    logToolRun("memory-recall", message, "succeeded");
+    return reply;
   }
 
   return "";
