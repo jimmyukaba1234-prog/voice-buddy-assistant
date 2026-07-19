@@ -29,7 +29,6 @@ function readLocalEnv() {
 // Proxy /api requests to the backend so the browser can use same-origin fetch("/api/chat").
 export default defineConfig(({ mode }) => {
   const env = { ...loadEnv(mode, process.cwd(), ""), ...readLocalEnv() };
-  const supabaseUrl = env.VITE_SUPABASE_URL;
 
   return {
     plugins: [react()],
@@ -48,16 +47,6 @@ export default defineConfig(({ mode }) => {
           target: "http://localhost:3001",
           changeOrigin: true,
         },
-        ...(supabaseUrl
-          ? {
-              "/supabase": {
-                target: supabaseUrl,
-                changeOrigin: true,
-                secure: true,
-                rewrite: (path) => path.replace(/^\/supabase/, ""),
-              },
-            }
-          : {}),
       },
     },
   };

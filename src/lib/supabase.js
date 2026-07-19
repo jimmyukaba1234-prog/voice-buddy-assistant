@@ -12,15 +12,11 @@ const supabaseAnonKeyValid = Boolean(
     (supabaseAnonKey.startsWith("sb_publishable_") ||
       supabaseAnonKey.split(".").length === 3)
 );
-const supabaseClientUrl =
-  viteEnv.DEV && typeof window !== "undefined"
-    ? `${window.location.origin}/supabase`
-    : supabaseUrl;
 
 export const supabaseConfigured = Boolean(
   supabaseUrlValid && supabaseAnonKeyValid
 );
 
 export const supabase = supabaseConfigured
-  ? createClient(supabaseClientUrl, supabaseAnonKey)
+  ? createClient(supabaseUrl, supabaseAnonKey)
   : null;
